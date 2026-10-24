@@ -1,4 +1,5 @@
 #include "session.hpp"
+#include "stats.hpp"
 
 namespace mora {
     bool PlaybackSession::mergeInto(Track& base, const Track& update) {
@@ -44,10 +45,51 @@ namespace mora {
         return changed;
     }
     void PlaybackSession::setRepeat(bool value) {
-        if (queue.repeat == value)
+        setMode(value ? QueueMode::RepeatAll : QueueMode::Sequential);
+    }
+    void PlaybackSession::setMode(QueueMode value, uint64_t seed) {
+        // An explicit seed must rebuild the order even when the mode is already shuffle: otherwise
+        // "set shuffle with this seed" silently keeps the previous permutation and the same request
+        // is no longer reproducible.
+        bool rebuild = value == QueueMode::Shuffle && seed != 0;
+        if (queue.mode == value && !rebuild)
             return;
-        queue.repeat = value;
+        queue.setMode(value, seed);
         touch();
+    }
+    bool PlaybackSession::playIndex(size_t value) {
+        if (!queue.setIndex(value))
+            return false;
+        touch();
+        return true;
+    }
+    bool PlaybackSession::removeIndex(size_t value) {
+        if (!queue.removeAt(value))
+            return false;
+        touch();
+        return true;
+    }
+    bool PlaybackSession::moveTrack(size_t from, size_t to) {
+        if (!queue.moveTrack(from, to))
+            return false;
+        touch();
+        return true;
+    }
+    void PlaybackSession::clearQueue() {
+        queue.clear();
+        touch();
+    }
+    bool PlaybackSession::enqueue(std::vector<Track> items) {
+        if (!queue.append(std::move(items)))
+            return false;
+        touch();
+        return true;
+    }
+    bool PlaybackSession::playNext(std::vector<Track> items) {
+        bool inserted = queue.insertNext(std::move(items));
+        if (inserted)
+            touch();
+        return inserted;
     }
     void PlaybackSession::refresh(const Track& track) {
         if (!track.id)
@@ -68,12 +110,26 @@ namespace mora {
                 mergeInto(row, track);
         touch();
     }
+    void PlaybackSession::reportEnd(bool completed) {
+        if (listenSink && playingReported && current.id) {
+            auto state = audioState();
+            listenSink->onTrackEnd(current, state.position, completed);
+        }
+        playingReported = false;
+    }
     void PlaybackSession::startTrack(const Track& track, std::string actualQuality,
                                      std::wstring url) {
+        // A replaced track counts as a listen when it actually played; the log decides how much of
+        // it to keep. Starting a new row always closes the previous one first.
+        reportEnd(false);
         setCurrent(track);
         actual = std::move(actualQuality);
         if (device)
             device->play(std::move(url));
+        if (listenSink && current.id) {
+            listenSink->onTrackStart(current, sourceHint);
+            playingReported = true;
+        }
     }
     void PlaybackSession::setQuality(std::string value) {
         if (requested == value)
@@ -101,6 +157,7 @@ namespace mora {
             device->seek(seconds);
     }
     void PlaybackSession::stop() {
+        reportEnd(false);
         if (device)
             device->stop();
     }
@@ -114,7 +171,8 @@ namespace mora {
             s.ids.push_back(track.id);
         s.index = queue.index;
         s.currentId = current.id;
-        s.repeat = queue.repeat;
+        s.repeat = queue.repeat();
+        s.mode = queue.mode;
         s.volume = desiredVolume;
         s.requestedQuality = requested;
         s.actualQuality = actual;

@@ -1,6 +1,8 @@
 #include "agent.hpp"
 #include "platform.hpp"
 #include "service.hpp"
+#include <cctype>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 
@@ -48,10 +50,185 @@ namespace mora {
                 --end;
             return text.substr(0, end);
         }
+        std::string trimmed(std::string value) {
+            auto blank = [](char c) {
+                return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+            };
+            while (!value.empty() && blank(value.back()))
+                value.pop_back();
+            size_t begin = 0;
+            while (begin < value.size() && blank(value[begin]))
+                ++begin;
+            return value.substr(begin);
+        }
+        std::string lowered(std::string value) {
+            for (auto& c : value)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return value;
+        }
+        bool writeJson(const std::filesystem::path& path, const Json& data) {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (!file)
+                return false;
+            file << data.dump(2) << '\n';
+            return static_cast<bool>(file);
+        }
+        std::string nowIso() {
+            auto now = std::time(nullptr);
+            std::tm utc{};
+            gmtime_s(&utc, &now);
+            char buffer[32] = {};
+            std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
+            return buffer;
+        }
+        bool truthy(const Json& object, const char* key) {
+            if (!object.is_object() || !object.contains(key))
+                return false;
+            const auto& value = object[key];
+            if (value.is_boolean())
+                return value.get<bool>();
+            if (value.is_object() || value.is_array())
+                return !value.empty();
+            if (value.is_number())
+                return value.get<double>() != 0;
+            return false;
+        }
+        // Providers spell the same capability several ways; take the first positive number.
+        int firstPositive(const Json& object, std::initializer_list<const char*> keys) {
+            if (!object.is_object())
+                return 0;
+            for (auto key : keys) {
+                if (!object.contains(key))
+                    continue;
+                const auto& value = object[key];
+                int64_t number = 0;
+                if (value.is_number_integer() || value.is_number_unsigned())
+                    number = value.get<int64_t>();
+                else if (value.is_number_float())
+                    number = static_cast<int64_t>(value.get<double>());
+                else if (value.is_string()) {
+                    try {
+                        number = std::stoll(value.get<std::string>());
+                    } catch (const std::exception&) {
+                        continue;
+                    }
+                } else
+                    continue;
+                if (number > 0)
+                    return static_cast<int>(std::min<int64_t>(number, 0x7FFFFFFF));
+            }
+            return 0;
+        }
+        std::vector<std::string> normalizedList(std::vector<std::string> items) {
+            std::vector<std::string> result;
+            for (auto& item : items) {
+                auto value = lowered(trimmed(item));
+                if (value.empty() ||
+                    std::find(result.begin(), result.end(), value) != result.end())
+                    continue;
+                result.push_back(std::move(value));
+            }
+            return result;
+        }
+        std::vector<std::string> stringList(const Json& value) {
+            std::vector<std::string> items;
+            if (value.is_string())
+                items.push_back(value.get<std::string>());
+            else if (value.is_array()) {
+                for (auto& item : value)
+                    if (item.is_string())
+                        items.push_back(item.get<std::string>());
+            }
+            return normalizedList(std::move(items));
+        }
+        // "text", "text+image" and "text->text" all appear in OpenAI-compatible model lists.
+        std::vector<std::string> splitModalities(const std::string& text) {
+            std::vector<std::string> items;
+            std::string current;
+            for (char c : text) {
+                if (c == '+' || c == ',' || c == '/' || c == '|') {
+                    items.push_back(current);
+                    current.clear();
+                } else
+                    current += c;
+            }
+            items.push_back(current);
+            return normalizedList(std::move(items));
+        }
+        // The sibling /models route of the configured chat endpoint: same scheme, host and port,
+        // so discovery never contacts a second service.
+        std::string modelsEndpoint(std::string url) {
+            if (auto cut = url.find('#'); cut != std::string::npos)
+                url.resize(cut);
+            if (auto cut = url.find('?'); cut != std::string::npos)
+                url.resize(cut);
+            while (!url.empty() && url.back() == '/')
+                url.pop_back();
+            for (auto suffix : {std::string("/chat/completions"), std::string("/completions")}) {
+                if (url.size() >= suffix.size() &&
+                    url.compare(url.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    url.resize(url.size() - suffix.size());
+                    break;
+                }
+            }
+            return url + "/models";
+        }
+        const char* roleLabel(const std::string& role) {
+            if (role == "user")
+                return "用户";
+            if (role == "assistant")
+                return "助手";
+            if (role == "system")
+                return "摘要";
+            return "工具";
+        }
+        // A summary that never needs the network: the oldest turns survive in a bounded, clearly
+        // labelled form, so a failed compression still preserves the conversation.
+        std::string deterministicSummary(const std::vector<AgentMessage>& older, const std::string& reason,
+                                         size_t limit) {
+            std::string body;
+            for (auto& message : older) {
+                body += std::string(roleLabel(message.role)) + ": " + message.content + "\n";
+                if (body.size() > limit * 2)
+                    break;
+            }
+            return summarize(reason + "\n" + body, limit);
+        }
+        // estimateMessageTokens is a frozen, string-typed helper: a provider tool turn may carry
+        // null or structured content, so the accounting only runs when every string field is one.
+        bool tokenEstimateSafe(const Json& messages) {
+            for (auto& message : messages) {
+                if (!message.is_object())
+                    return false;
+                for (auto key : {"role", "content", "name", "tool_call_id"})
+                    if (message.contains(key) && !message[key].is_string())
+                        return false;
+            }
+            return true;
+        }
+        const char* kCompressionInstruction =
+            "你是 MORA 音乐终端的对话压缩器。把用户给出的早期对话压缩成一段不超过 1200 字符的"
+            "中文摘要。必须保留：用户偏好（常听的歌手、风格、口味）、已经确认的事实（歌名、"
+            "歌手、歌曲或歌单 id、播放与喜欢的结果）、未完成的请求与待办、以及用户明确否定的"
+            "选项。不要编造新事实，不要添加寒暄、标题或解释，只输出摘要正文。";
         std::wstring systemDefault() {
             return L"你是 MORA 音乐终端的音乐助手。用中文简短回答（不超过 120 字）。"
                    L"需要事实、候选或播放状态时先调用工具，不要凭记忆编造歌名、歌手或播放结果。"
-                   L"工具返回 needs_player 时告诉用户先运行 mora 终端；写操作只在用户明确给出目标时调用。";
+                   L"工具返回 needs_player 时告诉用户先运行 mora 终端；写操作只在用户明确给出"
+                   L"目标时调用。\n"
+                   L"操作常识：\n"
+                   L"1) 模糊也要行动：能从上下文或常见口味推断就直接搜索/推荐并播放；只有真正"
+                   L"无法判断才问，且最多问一次；播放前不要反复确认。\n"
+                   L"2) 意图→操作：单曲→music_search 后 music_play(kind=song,id)；专辑或歌单→"
+                   L"music_play 或 music_open_collection(kind=album|playlist,id)，替换队列并播放"
+                   L"整个集合；歌手/风格/场景/心情（无明确专辑）→music_search(query=关键词, "
+                   L"limit=10..30) 取一组 id 后 music_queue_edit(op=replace, ids=[…]) 一次建立"
+                   L"多首队列并从第一首播放，禁止只播一首；不确定或随机→music_recommend 后 "
+                   L"music_play_random。\n"
+                   L"3) 替换 vs 追加：“换成/只听/播放这张专辑”=替换；“再加上/再来点/接着放/排在"
+                   L"后面”=append 或 add_next（插到当前曲之后），不得替换当前队列。\n"
+                   L"4) 系列请求取回 5..20 首（有界不超过 50）；工具返回 accepted 后必须用 "
+                   L"music_now_playing 确认真实状态，不得编造播放中。";
         }
     } // namespace
 
@@ -82,6 +259,9 @@ namespace mora {
                 config.reasoningEffort = value;
             config.maxOutputTokens = stored.value("maxOutputTokens", config.maxOutputTokens);
             config.maxRounds = stored.value("maxRounds", config.maxRounds);
+            config.contextTokens = stored.value("contextTokens", config.contextTokens);
+            config.contextFallbackTokens =
+                stored.value("contextFallbackTokens", config.contextFallbackTokens);
         }
         if (auto value = env("MORA_AGENT_BASE_URL"); !value.empty())
             config.baseUrl = value;
@@ -92,6 +272,38 @@ namespace mora {
                 throw AgentError("invalid_reasoning_effort", "unsupported reasoning effort");
             config.reasoningEffort = value;
         }
+        // The discovered catalog is the source of truth for the window and modalities of the
+        // selected model: the user never enters either by hand, and a model without a cached entry
+        // keeps the conservative fallback budget.
+        config.modelModalities.clear();
+        if (stored.is_object() && stored.contains("modelCatalog") &&
+            stored["modelCatalog"].is_object()) {
+            Json models = stored["modelCatalog"].value("models", Json::array());
+            for (auto& item : models) {
+                if (!item.is_object() || item.value("id", std::string()) != config.model)
+                    continue;
+                if (auto window = firstPositive(item, {"contextTokens"}); window > 0)
+                    config.contextTokens = window;
+                config.modelModalities = stringList(item.value("inputModalities", Json()));
+                for (auto& modality : stringList(item.value("outputModalities", Json())))
+                    if (std::find(config.modelModalities.begin(), config.modelModalities.end(),
+                                  modality) == config.modelModalities.end())
+                        config.modelModalities.push_back(modality);
+                break;
+            }
+        }
+        if (auto value = env("MORA_AGENT_CONTEXT_TOKENS"); !value.empty()) {
+            int parsed = 0;
+            try {
+                parsed = std::stoi(value);
+            } catch (const std::exception&) {
+                parsed = 0;
+            }
+            if (parsed <= 0)
+                throw AgentError("invalid_context_tokens",
+                                 "MORA_AGENT_CONTEXT_TOKENS must be a positive integer");
+            config.contextTokens = parsed;
+        }
         return config;
     }
 
@@ -99,14 +311,20 @@ namespace mora {
         if (!validReasoningEffort(config.reasoningEffort))
             throw AgentError("invalid_reasoning_effort", "unsupported reasoning effort");
         auto sessionId = agentSessionId();
-        Json stored = {{"baseUrl", config.baseUrl},
-                       {"sessionId", sessionId},
-                       {"model", config.model},
-                       {"reasoningEffort", config.reasoningEffort},
-                       {"maxOutputTokens", config.maxOutputTokens},
-                       {"maxRounds", config.maxRounds}};
-        std::ofstream file(agentFile("agent.json"), std::ios::binary | std::ios::trunc);
-        file << stored.dump(2) << '\n';
+        // Merge instead of replacing: the discovered catalog and the session id must survive a
+        // settings change, and the model key was never part of this file.
+        Json stored = readJson(agentFile("agent.json"));
+        if (!stored.is_object())
+            stored = Json::object();
+        stored["baseUrl"] = config.baseUrl;
+        stored["sessionId"] = sessionId;
+        stored["model"] = config.model;
+        stored["reasoningEffort"] = config.reasoningEffort;
+        stored["maxOutputTokens"] = config.maxOutputTokens;
+        stored["maxRounds"] = config.maxRounds;
+        stored["contextTokens"] = config.contextTokens;
+        stored["contextFallbackTokens"] = config.contextFallbackTokens;
+        writeJson(agentFile("agent.json"), stored);
     }
 
     bool agentKeyPresent() {
@@ -132,6 +350,169 @@ namespace mora {
             return {};
         auto clear = unprotect(bytes(encrypted));
         return std::string(clear.begin(), clear.end());
+    }
+
+    ModelCatalog fetchModelCatalog(const AgentConfig& config) {
+        ModelCatalog catalog;
+        catalog.endpoint = modelsEndpoint(config.baseUrl);
+        if (config.baseUrl.empty()) {
+            catalog.code = "bad_response";
+            catalog.error = "no model endpoint configured";
+            return catalog;
+        }
+        auto key = loadAgentKey();
+        if (key.empty()) {
+            catalog.code = "missing_key";
+            catalog.error = "no model key stored; run mora --set-agent-key";
+            return catalog;
+        }
+        Response response;
+        try {
+            Http http;
+            response = http.request(unutf8(catalog.endpoint), {},
+                                    L"User-Agent: mora-player/0.7.0\r\nAuthorization: Bearer " +
+                                        unutf8(key) + L"\r\n",
+                                    256 * 1024, false);
+        } catch (const std::exception& error) {
+            catalog.code = "network";
+            catalog.error = error.what();
+            return catalog;
+        }
+        if (response.status == 401 || response.status == 403) {
+            catalog.code = "unauthorized";
+            catalog.error = "provider refused the key (HTTP " + std::to_string(response.status) +
+                            "); the /models route needs the same credential as chat";
+            return catalog;
+        }
+        if (response.status == 404 || response.status == 405 || response.status == 501) {
+            catalog.code = "not_supported";
+            catalog.error = "endpoint does not expose a model list (HTTP " +
+                            std::to_string(response.status) + ")";
+            return catalog;
+        }
+        if (response.status == 429) {
+            catalog.code = "rate_limited";
+            catalog.error = "provider rate limit reached";
+            return catalog;
+        }
+        if (response.status >= 500) {
+            catalog.code = "server_error";
+            catalog.error = "provider error HTTP " + std::to_string(response.status);
+            return catalog;
+        }
+        if (response.status != 200) {
+            catalog.code = "bad_response";
+            catalog.error = "provider returned HTTP " + std::to_string(response.status);
+            return catalog;
+        }
+        auto parsed = Json::parse(response.body, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_object() || !parsed.contains("data") ||
+            !parsed["data"].is_array()) {
+            catalog.code = "bad_response";
+            catalog.error = "endpoint did not return an OpenAI-compatible data[] model list";
+            return catalog;
+        }
+        for (auto& item : parsed["data"]) {
+            if (!item.is_object())
+                continue;
+            ModelCapability model;
+            model.id = trimmed(item.value("id", std::string()));
+            if (model.id.empty())
+                continue;
+            Json provider = item.value("top_provider", Json::object());
+            model.contextTokens = firstPositive(
+                item, {"context_length", "context_window", "max_context_length", "max_model_len"});
+            if (model.contextTokens == 0)
+                model.contextTokens =
+                    firstPositive(provider, {"context_length", "context_window"});
+            model.maxOutputTokens =
+                firstPositive(item, {"max_output_tokens", "max_completion_tokens"});
+            if (model.maxOutputTokens == 0)
+                model.maxOutputTokens =
+                    firstPositive(provider, {"max_completion_tokens", "max_output_tokens"});
+            Json architecture = item.value("architecture", Json::object());
+            model.inputModalities = stringList(architecture.value("input_modalities", Json()));
+            if (model.inputModalities.empty())
+                model.inputModalities = stringList(item.value("input_modalities", Json()));
+            model.outputModalities = stringList(architecture.value("output_modalities", Json()));
+            if (model.outputModalities.empty())
+                model.outputModalities = stringList(item.value("output_modalities", Json()));
+            auto modality = architecture.value("modality", item.value("modality", std::string()));
+            if (!modality.empty()) {
+                auto arrow = modality.find("->");
+                if (model.inputModalities.empty())
+                    model.inputModalities = splitModalities(
+                        arrow == std::string::npos ? modality : modality.substr(0, arrow));
+                if (model.outputModalities.empty())
+                    model.outputModalities = splitModalities(
+                        arrow == std::string::npos ? std::string() : modality.substr(arrow + 2));
+            }
+            model.reasoning = truthy(item, "reasoning") || truthy(architecture, "reasoning") ||
+                              truthy(item.value("capabilities", Json::object()), "reasoning");
+            for (auto& parameter : stringList(item.value("supported_parameters", Json())))
+                if (parameter == "reasoning" || parameter == "include_reasoning" ||
+                    parameter == "reasoning_effort" || parameter == "thinking")
+                    model.reasoning = true;
+            catalog.models.push_back(std::move(model));
+        }
+        // A valid but empty list is still a successful discovery: MORA never invents a model.
+        catalog.ok = true;
+        return catalog;
+    }
+
+    void cacheModelCatalog(const ModelCatalog& catalog) {
+        // A failed discovery must not poison the offline view; the last good catalog stays.
+        if (!catalog.ok)
+            return;
+        Json stored = readJson(agentFile("agent.json"));
+        if (!stored.is_object())
+            stored = Json::object();
+        Json models = Json::array();
+        for (auto& model : catalog.models)
+            models.push_back(Json{{"id", model.id},
+                                  {"inputModalities", model.inputModalities},
+                                  {"outputModalities", model.outputModalities},
+                                  {"contextTokens", model.contextTokens},
+                                  {"maxOutputTokens", model.maxOutputTokens},
+                                  {"reasoning", model.reasoning}});
+        stored["modelCatalog"] = Json{{"ok", catalog.ok},
+                                      {"code", catalog.code},
+                                      {"endpoint", catalog.endpoint},
+                                      {"fetchedAt", nowIso()},
+                                      {"models", models}};
+        writeJson(agentFile("agent.json"), stored);
+    }
+
+    ModelCatalog cachedModelCatalog() {
+        ModelCatalog catalog;
+        auto stored = readJson(agentFile("agent.json"));
+        if (!stored.is_object() || !stored.contains("modelCatalog") ||
+            !stored["modelCatalog"].is_object()) {
+            catalog.code = "not_cached";
+            catalog.error = "no model catalog cached yet; run mora --models";
+            return catalog;
+        }
+        auto cached = stored["modelCatalog"];
+        catalog.ok = cached.value("ok", false);
+        catalog.code = cached.value("code", std::string());
+        catalog.error = cached.value("error", std::string());
+        catalog.endpoint = cached.value("endpoint", std::string());
+        Json models = cached.value("models", Json::array());
+        for (auto& item : models) {
+            if (!item.is_object())
+                continue;
+            ModelCapability model;
+            model.id = item.value("id", std::string());
+            if (model.id.empty())
+                continue;
+            model.inputModalities = stringList(item.value("inputModalities", Json()));
+            model.outputModalities = stringList(item.value("outputModalities", Json()));
+            model.contextTokens = firstPositive(item, {"contextTokens"});
+            model.maxOutputTokens = firstPositive(item, {"maxOutputTokens"});
+            model.reasoning = truthy(item, "reasoning");
+            catalog.models.push_back(std::move(model));
+        }
+        return catalog;
     }
 
     Json agentToolsFrom(const Json& musicTools) {
@@ -202,7 +583,7 @@ namespace mora {
         Http http;
         auto response = http.request(
             unutf8(config.baseUrl), body.dump(),
-            L"Content-Type: application/json\r\nUser-Agent: mora-player/0.6.0\r\n"
+            L"Content-Type: application/json\r\nUser-Agent: mora-player/0.7.0\r\n"
             L"x-opencode-session: " +
                 unutf8(sessionId) + L"\r\nAuthorization: Bearer " + unutf8(key) + L"\r\n",
             4 * 1024 * 1024, true);
@@ -232,9 +613,179 @@ namespace mora {
         return parsed;
     }
 
+    size_t estimateTokens(std::string_view text) {
+        size_t tokens = 0, ascii = 0;
+        for (unsigned char c : text) {
+            if (c < 0x80) {
+                ++ascii;
+                continue;
+            }
+            // One non-ASCII lead byte stands for one code point; CJK costs about one token each,
+            // which over-counts Latin scripts and keeps the budget conservative.
+            if ((c & 0xC0) != 0x80)
+                ++tokens;
+        }
+        return tokens + (ascii + 3) / 4;
+    }
+    size_t estimateMessageTokens(const Json& messages) {
+        // A provider tool turn legitimately carries "content": null, and a null name or
+        // tool_call_id is normal too, so read every field defensively instead of letting value<>
+        // throw a type error inside the budget arithmetic.
+        auto textOf = [](const Json& object, const char* key) -> std::string {
+            if (!object.contains(key))
+                return {};
+            const Json& value = object[key];
+            return value.is_string() ? value.get<std::string>() : std::string();
+        };
+        size_t total = 0;
+        for (auto& message : messages) {
+            if (!message.is_object())
+                continue;
+            total += 4; // per-message envelope overhead
+            total += estimateTokens(textOf(message, "role"));
+            total += estimateTokens(textOf(message, "content"));
+            total += estimateTokens(textOf(message, "name"));
+            if (message.contains("tool_calls") && !message["tool_calls"].is_null())
+                total += estimateTokens(message["tool_calls"].dump());
+        }
+        return total;
+    }
+
+    CompressionPlan planCompression(const AgentConfig& config, const std::wstring& systemPrompt,
+                                    const std::vector<AgentMessage>& history,
+                                    const std::string& userText) {
+        CompressionPlan plan;
+        plan.limitTokens = config.contextTokens > 0
+                               ? static_cast<size_t>(config.contextTokens)
+                               : static_cast<size_t>(config.contextFallbackTokens > 0
+                                                         ? config.contextFallbackTokens
+                                                         : 32768);
+        auto ratio = config.compressAt > 0 && config.compressAt <= 1 ? config.compressAt : .72;
+        auto threshold = static_cast<size_t>(static_cast<double>(plan.limitTokens) * ratio);
+        Json system = Json{{"role", "system"},
+                           {"content", utf8(systemPrompt.empty() ? systemDefault() : systemPrompt)}};
+        auto build = [&](const std::vector<AgentMessage>& kept, const std::string& summary) {
+            Json messages = Json::array();
+            messages.push_back(system);
+            if (!summary.empty())
+                messages.push_back(Json{{"role", "system"}, {"content", summary}});
+            for (auto& turn : kept)
+                messages.push_back(Json{{"role", turn.role},
+                                        {"content", turn.content},
+                                        {"tool_call_id", turn.toolCallId},
+                                        {"name", turn.name}});
+            messages.push_back(Json{{"role", "user"}, {"content", userText}});
+            return messages;
+        };
+        plan.messages = build(history, {});
+        plan.promptTokens = estimateMessageTokens(plan.messages);
+        plan.kept = history;
+        if (!config.autoCompress || plan.promptTokens <= threshold)
+            return plan;
+        // A leading system message is the previous checkpoint, not a turn: it is folded too, so a
+        // second compression merges into one summary instead of stacking checkpoints.
+        size_t firstTurn = 0;
+        while (firstTurn < history.size() && history[firstTurn].role == "system")
+            ++firstTurn;
+        std::vector<AgentMessage> older(history.begin(), history.begin() + firstTurn);
+        std::vector<AgentMessage> turns(history.begin() + firstTurn, history.end());
+        if (turns.size() < 2)
+            return plan; // nothing worth folding; the caller sees an honest prompt size
+        auto retain = std::min(config.keepRecentMessages ? config.keepRecentMessages : size_t(1),
+                               turns.size());
+        retain = std::max<size_t>(retain, 1);
+        auto keepFrom = turns.size() - retain;
+        older.insert(older.end(), turns.begin(), turns.begin() + keepFrom);
+        std::vector<AgentMessage> kept(turns.begin() + keepFrom, turns.end());
+        // Never open the kept block with a reply whose question was folded away.
+        while (kept.size() > 1 && kept.front().role == "assistant") {
+            older.push_back(kept.front());
+            kept.erase(kept.begin());
+        }
+        auto placeholder = [&]() {
+            return std::string("[早前对话摘要]\n") +
+                   deterministicSummary(older, "[确定性截断摘要：未经模型摘要]", 1200);
+        };
+        Json messages = build(kept, placeholder());
+        // keepRecentMessages is the retention target. Only when the retained turns alone still
+        // exceed the window does the plan fold more of them (oldest first) so a request is never
+        // knowingly oversized; the summary and the reported folded count stay honest either way.
+        while (estimateMessageTokens(messages) > threshold && kept.size() > 1) {
+            older.push_back(kept.front());
+            kept.erase(kept.begin());
+            if (kept.size() > 1 && kept.front().role == "assistant") {
+                older.push_back(kept.front());
+                kept.erase(kept.begin());
+            }
+            messages = build(kept, placeholder());
+        }
+        plan.messages = messages;
+        plan.promptTokens = estimateMessageTokens(messages);
+        plan.needed = true;
+        plan.foldedTurns = older.size();
+        plan.older = older;
+        plan.kept = kept;
+        return plan;
+    }
+
+    namespace {
+        struct SummaryResult {
+            std::string text, code; // empty code means the model produced the summary
+        };
+        // One bounded, tool-free summary call. A failure degrades to the labelled deterministic
+        // truncation, so the folded turns survive and the caller can report the degradation.
+        SummaryResult summarizeBounded(const AgentConfig& config, const ModelTransport& transport,
+                                       const std::vector<AgentMessage>& older) {
+            SummaryResult result;
+            if (older.empty())
+                return result;
+            std::string transcript;
+            for (auto& message : older) {
+                transcript += std::string(roleLabel(message.role)) + ": " + message.content + "\n";
+                if (transcript.size() >= 8000)
+                    break;
+            }
+            transcript = summarize(transcript, 8000);
+            result.code = "empty_summary";
+            try {
+                const auto& send = transport ? transport
+                                             : ModelTransport([](const AgentConfig& settings,
+                                                                 const Json& messages,
+                                                                 const Json& tools) {
+                                                   return transportChat(settings, messages, tools);
+                                               });
+                Json messages = Json::array();
+                messages.push_back(Json{{"role", "system"}, {"content", kCompressionInstruction}});
+                messages.push_back(
+                    Json{{"role", "user"}, {"content", "早期对话记录：\n" + transcript}});
+                // One bounded call with no tools: a summary can never fan out into a tool loop.
+                auto reply = parseAssistant(send(config, messages, Json::array()));
+                auto text = trimmed(utf8(reply.text));
+                if (!text.empty()) {
+                    result.text = summarize(text, 1200);
+                    result.code.clear();
+                    return result;
+                }
+            } catch (const AgentError& error) {
+                result.code = error.code.empty() ? std::string("provider_error") : error.code;
+            } catch (const std::exception&) {
+                result.code = "network";
+            }
+            result.text = deterministicSummary(
+                older, "[压缩降级: " + result.code + "] 早期对话确定性截断（可能缺失细节）：", 1200);
+            return result;
+        }
+    } // namespace
+
+    std::string summarizeHistory(const AgentConfig& config, const ModelTransport& transport,
+                                 const std::vector<AgentMessage>& older) {
+        return summarizeBounded(config, transport, older).text;
+    }
+
     ChatOutcome runChatLoop(AgentConfig config, const std::string& userText,
                             const MusicToolExecutor& execute, const ModelTransport& transport,
-                            const std::wstring& systemPrompt) {
+                            const std::wstring& systemPrompt,
+                            const std::vector<AgentMessage>& history) {
         ChatOutcome outcome;
         if (userText.empty()) {
             outcome.code = "invalid_arguments";
@@ -279,17 +830,52 @@ namespace mora {
         personaTool["type"] = "function";
         personaTool["function"] = function;
         tools.push_back(personaTool);
-        Json messages = Json::array();
-        messages.push_back(Json{{"role", "system"},
-                                {"content", utf8(systemPrompt.empty() ? systemDefault()
-                                                                      : systemPrompt)}});
-        messages.push_back(Json{{"role", "user"}, {"content", userText}});
         const auto& send = transport ? transport
                                      : ModelTransport([](const AgentConfig& cfg, const Json& m,
                                                          const Json& t) {
                                            return transportChat(cfg, m, t);
                                        });
+        // Conversation memory. The oldest turns are dropped first so the newest context wins when
+        // the caller hands over more history than the message budget allows; a leading compaction
+        // checkpoint stays, because it is the only trace of the turns it replaced.
+        std::vector<AgentMessage> memory = history;
+        size_t checkpoint = 0;
+        while (checkpoint < memory.size() && memory[checkpoint].role == "system")
+            ++checkpoint;
+        auto messageBudget = static_cast<size_t>(std::max(2, config.maxContextMessages));
+        auto turnBudget = messageBudget > 2 ? messageBudget - 2 : 0;
+        while (memory.size() > checkpoint + turnBudget && memory.size() > checkpoint)
+            memory.erase(memory.begin() + static_cast<std::ptrdiff_t>(checkpoint));
+        auto plan = planCompression(config, systemPrompt, memory, userText);
+        outcome.contextLimitTokens = plan.limitTokens;
+        outcome.promptTokens = plan.promptTokens;
+        Json messages = plan.messages;
+        // Over the window: fold the oldest turns into one summary before the request goes out. A
+        // failed summary is labelled in band and the folded turns are still there in bounded form,
+        // so history is never silently dropped while the turn still reports success.
+        if (plan.needed) {
+            auto summary = summarizeBounded(config, send, plan.older);
+            if (!summary.text.empty() && messages.size() > 1 && messages[1].is_object() &&
+                messages[1].value("role", std::string()) == "system")
+                messages[1]["content"] = "[早前对话摘要]\n" + summary.text;
+            outcome.compressedMessages = static_cast<int>(plan.foldedTurns);
+            outcome.compressionDegraded = !summary.code.empty();
+            outcome.compressionCode = summary.code;
+            // A degraded compression is visible evidence, not a silent success: the trace keeps
+            // the code and the folded count next to the tool calls.
+            if (!summary.code.empty())
+                outcome.trace.push_back(
+                    Json{{"round", -1},
+                         {"compression", "degraded"},
+                         {"code", summary.code},
+                         {"foldedTurns", static_cast<int64_t>(plan.foldedTurns)},
+                         {"resultBytes", static_cast<int64_t>(summary.text.size())},
+                         {"resultSummary", summarize(summary.text, 200)}});
+        }
         for (int round = 0; round < config.maxRounds; ++round) {
+            // The accounting describes the request this round actually sends.
+            if (tokenEstimateSafe(messages))
+                outcome.promptTokens = estimateMessageTokens(messages);
             Json response;
             try {
                 response = send(config, messages, tools);
@@ -309,7 +895,14 @@ namespace mora {
                 return outcome;
             }
             auto choices = response.value("choices", Json::array());
-            messages.push_back(choices[0].value("message", Json::object()));
+            auto assistant = choices[0].value("message", Json::object());
+            if (!assistant.is_object())
+                assistant = Json::object();
+            // A tool-calling assistant turn normally carries content: null. Normalising it to an
+            // empty string keeps the wire shape valid and the token estimator type-safe.
+            if (!assistant.contains("content") || assistant["content"].is_null())
+                assistant["content"] = "";
+            messages.push_back(assistant);
             for (auto& call : reply.calls) {
                 if (++outcome.toolCalls > config.maxToolCalls) {
                     outcome.code = "tool_budget";

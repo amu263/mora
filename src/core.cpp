@@ -1,6 +1,8 @@
 #include "core.hpp"
 #include <cwctype>
 #include <fstream>
+#include <numeric>
+#include <random>
 #include <sstream>
 
 namespace mora {
@@ -295,21 +297,110 @@ namespace mora {
         return c == 405 || c == 429 || c == 460 || c == 461 || c == 462 || c == -460 || c == -461 ||
                c == -462 || c == 509;
     }
+    const char* queueModeName(QueueMode mode) {
+        switch (mode) {
+        case QueueMode::RepeatAll:
+            return "repeat_all";
+        case QueueMode::RepeatOne:
+            return "repeat_one";
+        case QueueMode::Shuffle:
+            return "shuffle";
+        default:
+            return "sequential";
+        }
+    }
+    bool parseQueueMode(std::string_view value, QueueMode& out) {
+        for (auto mode : queueModes()) {
+            if (value == queueModeName(mode)) {
+                out = mode;
+                return true;
+            }
+        }
+        // Accept the words a listener or a model is most likely to use.
+        if (value == "sequence" || value == "order" || value == "normal") {
+            out = QueueMode::Sequential;
+            return true;
+        }
+        if (value == "repeat" || value == "loop" || value == "loop_all") {
+            out = QueueMode::RepeatAll;
+            return true;
+        }
+        if (value == "single" || value == "loop_one" || value == "one") {
+            out = QueueMode::RepeatOne;
+            return true;
+        }
+        if (value == "random" || value == "shuffle_all") {
+            out = QueueMode::Shuffle;
+            return true;
+        }
+        return false;
+    }
+    const std::vector<QueueMode>& queueModes() {
+        static const std::vector<QueueMode> modes{QueueMode::Sequential, QueueMode::RepeatAll,
+                                                  QueueMode::RepeatOne, QueueMode::Shuffle};
+        return modes;
+    }
     void Queue::assign(std::vector<Track> items, size_t selected) {
         tracks = std::move(items);
         index = tracks.empty() ? 0 : std::min(selected, tracks.size() - 1);
+        if (mode == QueueMode::Shuffle)
+            rebuildShuffle(1);
     }
     Track* Queue::current() {
         return index < tracks.size() ? &tracks[index] : nullptr;
     }
+    void Queue::rebuildShuffle(uint64_t seed) {
+        shuffleOrder.resize(tracks.size());
+        for (size_t i = 0; i < shuffleOrder.size(); ++i)
+            shuffleOrder[i] = i;
+        std::mt19937 rng(static_cast<uint32_t>(seed ? seed : 1));
+        std::shuffle(shuffleOrder.begin(), shuffleOrder.end(), rng);
+        shuffleCursor = 0;
+        // Enabling shuffle mid-track must not restart the song the listener is hearing.
+        if (index < shuffleOrder.size()) {
+            auto found = std::find(shuffleOrder.begin(), shuffleOrder.end(), index);
+            if (found != shuffleOrder.end())
+                std::iter_swap(shuffleOrder.begin(), found);
+        }
+    }
+    void Queue::setMode(QueueMode value, uint64_t seed) {
+        mode = value;
+        if (mode == QueueMode::Shuffle)
+            rebuildShuffle(seed);
+        else
+            shuffleOrder.clear(), shuffleCursor = 0;
+    }
+    void Queue::setRepeat(bool value) {
+        setMode(value ? QueueMode::RepeatAll : QueueMode::Sequential);
+    }
     bool Queue::next() {
         if (tracks.empty())
             return false;
+        switch (mode) {
+        case QueueMode::RepeatOne:
+            return true; // same row: the caller replays the track it already owns
+        case QueueMode::Shuffle: {
+            if (shuffleOrder.size() != tracks.size())
+                rebuildShuffle(1);
+            if (shuffleCursor + 1 < shuffleOrder.size()) {
+                index = shuffleOrder[++shuffleCursor];
+                return true;
+            }
+            // The pass is over. Wrap over the *same* permutation instead of reshuffling: a shuffle
+            // queue still keeps playing, and next()/previous() stay invertible so a failed playback
+            // can roll back one step without silently changing the order the caller asked for.
+            shuffleCursor = 0;
+            index = shuffleOrder[0];
+            return true;
+        }
+        default:
+            break;
+        }
         if (index + 1 < tracks.size()) {
             ++index;
             return true;
         }
-        if (repeat) {
+        if (mode == QueueMode::RepeatAll) {
             index = 0;
             return true;
         }
@@ -318,15 +409,102 @@ namespace mora {
     bool Queue::previous() {
         if (tracks.empty())
             return false;
+        if (mode == QueueMode::RepeatOne)
+            return true;
+        if (mode == QueueMode::Shuffle) {
+            if (shuffleOrder.size() != tracks.size())
+                rebuildShuffle(1);
+            if (shuffleCursor > 0) {
+                index = shuffleOrder[--shuffleCursor];
+                return true;
+            }
+            return false;
+        }
         if (index > 0) {
             --index;
             return true;
         }
-        if (repeat) {
+        if (mode == QueueMode::RepeatAll) {
             index = tracks.size() - 1;
             return true;
         }
         return false;
+    }
+    bool Queue::setIndex(size_t value) {
+        if (value >= tracks.size() || value == index)
+            return false;
+        index = value;
+        if (mode == QueueMode::Shuffle) {
+            auto found = std::find(shuffleOrder.begin(), shuffleOrder.end(), index);
+            if (found != shuffleOrder.end())
+                shuffleCursor = static_cast<size_t>(found - shuffleOrder.begin());
+        }
+        return true;
+    }
+    bool Queue::removeAt(size_t value) {
+        if (value >= tracks.size())
+            return false;
+        tracks.erase(tracks.begin() + static_cast<std::ptrdiff_t>(value));
+        if (index > value)
+            --index;
+        else if (index >= tracks.size())
+            index = tracks.empty() ? 0 : tracks.size() - 1;
+        if (mode == QueueMode::Shuffle)
+            rebuildShuffle(1);
+        return true;
+    }
+    bool Queue::moveTrack(size_t from, size_t to) {
+        if (from >= tracks.size() || to >= tracks.size() || from == to)
+            return false;
+        Track moved = std::move(tracks[from]);
+        tracks.erase(tracks.begin() + static_cast<std::ptrdiff_t>(from));
+        tracks.insert(tracks.begin() + static_cast<std::ptrdiff_t>(to), std::move(moved));
+        // Follow the row the listener is hearing instead of its old slot number.
+        if (index == from)
+            index = to;
+        else if (from < index && to >= index)
+            --index;
+        else if (from > index && to <= index)
+            ++index;
+        if (mode == QueueMode::Shuffle)
+            rebuildShuffle(1);
+        return true;
+    }
+    void Queue::clear() {
+        tracks.clear();
+        shuffleOrder.clear();
+        shuffleCursor = 0;
+        index = 0;
+    }
+    bool Queue::append(std::vector<Track> items) {
+        bool added = false;
+        for (auto& item : items) {
+            if (!item.id)
+                continue;
+            tracks.push_back(std::move(item));
+            added = true;
+        }
+        if (added && mode == QueueMode::Shuffle)
+            rebuildShuffle(1);
+        return added;
+    }
+    bool Queue::insertNext(std::vector<Track> items) {
+        if (tracks.empty()) {
+            assign(std::move(items));
+            return !tracks.empty();
+        }
+        size_t at = std::min(index + 1, tracks.size());
+        bool added = false;
+        for (auto& item : items) {
+            if (!item.id)
+                continue;
+            tracks.insert(tracks.begin() + static_cast<std::ptrdiff_t>(at), std::move(item));
+            ++at;
+            added = true;
+        }
+        if (added && mode == QueueMode::Shuffle)
+            rebuildShuffle(1);
+        return added;
     }
     static double luminance(RGB c) {
         auto f = [](int x) {

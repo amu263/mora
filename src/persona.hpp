@@ -34,6 +34,15 @@ namespace mora {
 
     // The model system prompt for one persona, including how the user asked to be addressed.
     std::wstring personaSystemPrompt(const Persona& persona, const std::wstring& userName);
+    // The bounded "act on vague requests" rules appended to every persona prompt: the same
+    // intent-to-operation mapping for built-ins and custom personas, fronted by one line in the
+    // persona's own voice. Kept short on purpose, so the persona contract stays small.
+    std::wstring personaIntentGuidance(const Persona& persona);
+    // Short line the conversation shows while a model request is in flight. Every built-in carries
+    // at least three lines and rotates through them by `index` (negative indices are wrapped); a
+    // custom persona without its own corpus gets a deterministic fallback derived from its id, so
+    // the same persona always says the same thing instead of a generic stock phrase.
+    std::wstring personaWaitLine(const Persona& persona, int index);
     // Turns the persona's taste into a bounded search seed for music_recommend.
     std::wstring personaSearchSeed(const Persona& persona);
 

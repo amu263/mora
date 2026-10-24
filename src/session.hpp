@@ -3,6 +3,7 @@
 #include "core.hpp"
 
 namespace mora {
+    class ListenSink;
     // Copyable view of the authoritative playback state. Reports and tests compare snapshots
     // instead of reaching into the session, so every entry point reads the same numbers.
     struct SessionSnapshot {
@@ -10,6 +11,7 @@ namespace mora {
         size_t index = 0;
         int64_t currentId = 0;
         bool repeat = false;
+        QueueMode mode = QueueMode::Sequential;
         double volume = .65;
         std::string requestedQuality = "lossless", actualQuality;
         uint64_t revision = 0, request = 0;
@@ -27,8 +29,12 @@ namespace mora {
         std::string requested = "lossless", actual;
         double desiredVolume = .65;
         uint64_t revision = 0, request = 0;
+        ListenSink* listenSink = nullptr;
+        std::string sourceHint = "unknown";
+        bool playingReported = false;
 
         void touch() { ++revision; }
+        void reportEnd(bool completed);
         static bool mergeInto(Track& base, const Track& update);
 
       public:
@@ -52,8 +58,21 @@ namespace mora {
         }
         const Track& playing() const { return current; }
         bool move(int amount);
-        bool repeat() const { return queue.repeat; }
+        bool repeat() const { return queue.repeat(); }
         void setRepeat(bool value);
+        // Queue control the terminal, MCP adapters and the model loop all share. Every mutator
+        // touches the revision so a stale reply can never overwrite newer queue state.
+        QueueMode mode() const { return queue.mode; }
+        void setMode(QueueMode value, uint64_t seed = 1);
+        bool playIndex(size_t value);
+        bool removeIndex(size_t value);
+        bool moveTrack(size_t from, size_t to);
+        void clearQueue();
+        bool enqueue(std::vector<Track> items);
+        bool playNext(std::vector<Track> items);
+        bool queueEmpty() const { return queue.tracks.empty(); }
+        size_t queueSize() const { return queue.tracks.size(); }
+        size_t queueIndex() const { return queue.index; }
         // Merge richer metadata for one id into the queue row and the current track. Non-empty
         // fields win, so a stale or partial response can never blank out loaded metadata.
         void refresh(const Track& track);
@@ -74,6 +93,11 @@ namespace mora {
         void seek(double seconds);
         void stop();
         AudioState audioState() const;
+        // Playback history hook. The session is the one place that knows a track really started,
+        // so the listen log is fed from here instead of from every entry point.
+        void attachListenSink(ListenSink* sink) { listenSink = sink; }
+        void setSource(std::string value) { sourceHint = std::move(value); }
+        const std::string& source() const { return sourceHint; }
 
         SessionSnapshot snapshot() const;
     };

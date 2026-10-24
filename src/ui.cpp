@@ -2,10 +2,12 @@
 #include "agent.hpp"
 #include "bridge.hpp"
 #include "commands.hpp"
+#include "context.hpp"
 #include "mascot.hpp"
 #include "persona.hpp"
 #include "qrcodegen.hpp"
 #include "settings.hpp"
+#include "stats.hpp"
 #include "worker.hpp"
 #include "session.hpp"
 #include "ui_tool_calls.hpp"
@@ -16,8 +18,8 @@
 #include <shellapi.h>
 
 namespace mora {
-    enum class Modal { None, SavedSession, Login, Qr, Phone, Code, Save, Help, Quality, Guide, Ai, AiKey, AiModel, Agent, Settings, Name,
-                       Persona, Device };
+    enum class Modal { None, SavedSession, Login, Qr, Phone, Code, Save, Help, Quality, Guide, Ai, AiKey, AiModel, AiModels, Agent, Settings, Name,
+                       Persona, Device, Stats };
     enum Action {
         A_Search = 1,
         A_Songs,
@@ -60,6 +62,22 @@ namespace mora {
         A_Name,
         A_Persona,
         A_Device,
+        A_Mode,
+        A_Detail,
+        A_ReactToggle,
+        A_ReactSlower,
+        A_ReactFaster,
+        A_ReactCharsDown,
+        A_ReactCharsUp,
+        A_ReviewCharsDown,
+        A_ReviewCharsUp,
+        A_CompressToggle,
+        A_AiDiscover,
+        A_AiCached,
+        A_StatsDay,
+        A_StatsMonth,
+        A_StatsYear,
+        A_ModelRow = 70000,
         A_PersonaRow = 50000,
         A_DeviceRow = 60000,
         A_Progress = 80,
@@ -100,6 +118,34 @@ namespace mora {
         int64_t reactSong = 0;
         Clock::time_point lastReaction{};
         int reactCount = 0;
+        // User-tunable reaction budget and review length, persisted through settings.json.
+        int reactMinSeconds = 45, reactMaxChars = 25, reviewChars = 1000;
+        bool autoCompress = true;
+        int contextLimitTokens = 0;
+        // Song detail page: a read-only overlay over the page that opened it, so Esc returns there.
+        bool detail = false, detailFollow = true;
+        int detailScroll = 0;
+        // While a model request is in flight the conversation rotates the persona's waiting lines.
+        int waitLineIndex = -1;
+        Clock::time_point waitLineSince{};
+        bool chatWaiting = false;
+        // Conversation memory (context.hpp) and the listen log (stats.hpp). Both stay in the user's
+        // own data directory and are only created for real interactive runs.
+        Conversation conversation;
+        std::unique_ptr<ListenHistory> listenHistory;
+        ListenPeriod statsPeriod = ListenPeriod::Day;
+        ListenStats statsReport;
+        bool statsLoaded = false;
+        int statsScroll = 0;
+        size_t lastPromptTokens = 0, lastContextTokens = 0;
+        // Model discovery runs off the UI thread; tick() picks the catalog up when it lands.
+        std::thread discoverThread;
+        std::mutex discoverMutex;
+        std::optional<ModelCatalog> discoverResult;
+        std::atomic<bool> discoverRunning{false};
+        std::vector<ModelCapability> modelList;
+        int modelSelected = 0;
+        bool modelFromCache = false;
         std::vector<Track> rows, backRows, saveRows;
         std::set<int64_t> likes;
         std::set<int64_t> detailsAsked;
@@ -190,6 +236,217 @@ namespace mora {
             for (size_t i = 0; i < personaList.size(); ++i)
                 if (personaList[i].id == persona.id)
                     personaSelected = static_cast<int>(i);
+        }
+        // Queue modes are shared with the MCP adapter and the model loop; the UI only adds a
+        // readable label and keeps the canonical name available for commands and diagnostics.
+        static std::wstring modeLabel(QueueMode mode) {
+            switch (mode) {
+            case QueueMode::RepeatAll:
+                return L"列表循环";
+            case QueueMode::RepeatOne:
+                return L"单曲循环";
+            case QueueMode::Shuffle:
+                return L"随机";
+            default:
+                return L"顺序";
+            }
+        }
+        std::string modeName() const { return queueModeName(session.mode()); }
+        std::wstring qualityLabel() const {
+            for (size_t i = 0; i < qualities.size(); ++i)
+                if (session.quality() == qualities[i])
+                    return qualityNames[i];
+            return unutf8(session.quality());
+        }
+        // The requested quality is a preference; the actual one is what the account really got.
+        std::wstring actualQualityLabel() const {
+            const auto& actual = session.actualQuality();
+            if (actual.empty())
+                return qualityLabel();
+            for (size_t i = 0; i < qualities.size(); ++i)
+                if (actual == qualities[i])
+                    return qualityNames[i];
+            return unutf8(actual);
+        }
+        // Persist one preference right away so a crash cannot silently lose a UI setting. Demo and
+        // measurement runs never touch the user's own settings file.
+        void persistSetting(const std::function<void(Settings&)>& change) {
+            if (options.demo || options.seconds > 0 || !options.snapshot.empty())
+                return;
+            auto settings = Settings::load(stateDirectory());
+            change(settings);
+            settings.save(stateDirectory());
+        }
+        static std::wstring durationText(int64_t seconds) {
+            int64_t hours = seconds / 3600, minutes = (seconds % 3600) / 60;
+            if (hours > 0)
+                return std::to_wstring(hours) + L" 小时 " + std::to_wstring(minutes) + L" 分";
+            return std::to_wstring(minutes) + L" 分 " + std::to_wstring(seconds % 60) + L" 秒";
+        }
+        void announceMode() {
+            message(L"队列模式 · " + modeLabel(session.mode()) + L" (" + unutf8(modeName()) + L")");
+        }
+        void applyQueueMode(QueueMode mode) {
+            session.setMode(mode);
+            persistSetting([mode](Settings& s) { s.queueMode = mode; });
+            announceMode();
+        }
+        void cycleQueueMode() {
+            const auto& modes = queueModes();
+            size_t index = 0;
+            for (size_t i = 0; i < modes.size(); ++i)
+                if (modes[i] == session.mode())
+                    index = i;
+            applyQueueMode(modes[(index + 1) % modes.size()]);
+        }
+        // The detail page is an overlay: it remembers whether it was opened from the homepage or
+        // from a result/queue page, so Esc always returns to the same place.
+        void openDetail() {
+            detail = true;
+            detailFollow = true;
+            detailScroll = 0;
+            chatView = false;
+            searchFocus = false;
+            modal = Modal::None;
+        }
+        // Model discovery is one bounded request off the UI thread; tick() publishes the result. A
+        // failure is reported with its code instead of inventing a model list.
+        void startDiscovery(bool forceFetch) {
+            if (options.demo) {
+                message(L"演示模式 · 模型发现请退出后运行 mora");
+                return;
+            }
+            if (discoverRunning) {
+                message(L"正在从端点发现模型…");
+                return;
+            }
+            if (!forceFetch) {
+                auto cached = cachedModelCatalog();
+                if (cached.models.empty()) {
+                    message(L"还没有缓存的模型目录 · 按 F 从端点发现");
+                    return;
+                }
+                modelList = cached.models;
+                modelFromCache = true;
+                modelSelected = 0;
+                auto config = loadAgentConfig();
+                for (size_t i = 0; i < modelList.size(); ++i)
+                    if (modelList[i].id == config.model)
+                        modelSelected = (int)i;
+                modal = Modal::AiModels;
+                message(L"已缓存 " + std::to_wstring(modelList.size()) +
+                        L" 个模型 · Enter 采用 · F 重新发现");
+                return;
+            }
+            if (discoverThread.joinable())
+                discoverThread.join();
+            discoverRunning = true;
+            message(L"正在从端点发现模型…");
+            discoverThread = std::thread([this] {
+                ModelCatalog catalog;
+                try {
+                    catalog = fetchModelCatalog(loadAgentConfig());
+                } catch (const std::exception& e) {
+                    catalog.ok = false;
+                    catalog.code = "exception";
+                    catalog.error = e.what();
+                }
+                if (catalog.ok)
+                    cacheModelCatalog(catalog);
+                std::lock_guard lock(discoverMutex);
+                discoverResult = std::move(catalog);
+                discoverRunning = false;
+            });
+        }
+        void handleDiscoveryResult() {
+            std::optional<ModelCatalog> finished;
+            {
+                std::lock_guard lock(discoverMutex);
+                finished.swap(discoverResult);
+            }
+            if (!finished)
+                return;
+            if (!finished->ok) {
+                auto code = finished->code.empty() ? std::string("unknown") : finished->code;
+                message(L"模型发现失败 [" + unutf8(code) + L"]：" +
+                        sanitize(unutf8(finished->error.empty() ? std::string("端点没有返回详情")
+                                                                : finished->error)));
+                return;
+            }
+            if (finished->models.empty()) {
+                message(L"端点没有返回可用模型 · 可按 M 手填模型 ID");
+                return;
+            }
+            modelList = finished->models;
+            modelFromCache = false;
+            modelSelected = 0;
+            auto config = loadAgentConfig();
+            for (size_t i = 0; i < modelList.size(); ++i)
+                if (modelList[i].id == config.model)
+                    modelSelected = (int)i;
+            modal = Modal::AiModels;
+            message(L"发现 " + std::to_wstring(modelList.size()) +
+                    L" 个模型 · ↑↓ 选择，Enter 采用");
+        }
+        // Adopting a discovered model stores its id, its reported context window and its modalities.
+        // Modalities are only ever reported, never chosen by the listener.
+        void adoptModel(int index) {
+            if (index < 0 || index >= (int)modelList.size())
+                return;
+            const auto& capability = modelList[(size_t)index];
+            auto config = loadAgentConfig();
+            config.model = capability.id;
+            config.contextTokens = capability.contextTokens;
+            config.modelModalities = capability.inputModalities;
+            saveAgentConfig(config);
+            contextLimitTokens = capability.contextTokens;
+            persistSetting([this](Settings& s) { s.contextLimitTokens = contextLimitTokens; });
+            message(L"已采用模型 " + unutf8(capability.id) + L" · 上下文 " +
+                    (capability.contextTokens
+                         ? std::to_wstring(capability.contextTokens) + L" tokens"
+                         : std::wstring(L"端点未报告上下文")));
+            modal = Modal::Ai;
+        }
+        // Listen reports come from the local log only; a period with no rows is reported as empty
+        // instead of showing a blank panel.
+        void loadStats(ListenPeriod period) {
+            statsPeriod = period;
+            statsLoaded = false;
+            statsScroll = 0;
+            if (!listenHistory) {
+                message(L"演示模式不写入听歌记录 · 请退出后运行 mora");
+                return;
+            }
+            statsReport = listenHistory->aggregate(period);
+            statsLoaded = true;
+            modal = Modal::Stats;
+            if (statsReport.plays == 0)
+                message(L"这个周期还没有听歌记录 · 播放几首后再看");
+        }
+        // The review is written by the model from the real local aggregate. With no data, or when
+        // the model fails, the player says so and never fabricates a comment.
+        void startReview() {
+            if (!listenHistory) {
+                message(L"演示模式不能写锐评 · 请退出后运行 mora");
+                return;
+            }
+            auto stats = listenHistory->aggregate(statsPeriod);
+            if (stats.plays <= 0) {
+                message(L"还没有听歌记录，先播放几首再来写锐评");
+                return;
+            }
+            int target = std::clamp(reviewChars, 200, 4000);
+            std::wstring prompt =
+                L"下面是我真实的听歌统计（由本机播放器记录，只包含这些数据）：\n" +
+                unutf8(listenStatsJson(stats).dump()) + L"\n请据此写一份约 " +
+                std::to_wstring(target) +
+                L" 字的听歌锐评，必须覆盖：歌品与性格画像、特殊歌曲、高频曲目、听歌风格。";
+            prompt += L"只能引用统计里真实出现的歌曲、歌手与数字；数据不足就如实指出不足，"
+                      L"不要编造任何记录。";
+            std::wstring extra =
+                L"这一次是长文锐评任务，请写约 " + std::to_wstring(target) +
+                L" 字，可以超过上面 120 字的限制；不要调用会改变播放或账号状态的工具。";
+            startChat(prompt, L"请为我的听歌记录写一份锐评", true, extra);
         }
         bool selectPersona(const std::string& id, bool announce) {
             const Persona* found = nullptr;
@@ -308,13 +565,16 @@ namespace mora {
             busy = false;
             qrkey.clear();
         }
-        void startChat(const std::wstring& prompt, const std::wstring& label = {}) {
+        // `remember` keeps automatic track reactions out of the stored memory, and `extraSystem`
+        // carries a task-specific instruction (the review) without changing the persona contract.
+        void startChat(const std::wstring& prompt, const std::wstring& label = {},
+                       bool remember = true, const std::wstring& extraSystem = {}) {
             if (options.demo) {
                 message(L"演示模式 · 模型请求请退出后运行 mora");
                 return;
             }
             if (busy || chatRunning) {
-                message(L"正在处理上一项操作，请稍候");
+                message(L"正在处理上一件事，请稍候");
                 return;
             }
             if (chatThread.joinable())
@@ -325,28 +585,41 @@ namespace mora {
             home = false;
             chatView = true;
             searchFocus = true;
-            chatLog.push_back({label.empty() ? prompt : label, L"正在联系模型…"});
+            chatLog.push_back({label.empty() ? prompt : label, personaWaitLine(persona, 0)});
             chatScroll = 0;
+            waitLineIndex = 0;
+            waitLineSince = Clock::now();
+            chatWaiting = true;
             if (chatLog.size() > 8)
                 chatLog.erase(chatLog.begin());
             message(L"模型正在处理…");
-            // The persona and the user's chosen name must be captured on the UI thread: the chat
-            // worker may not read mutable UI state while the main thread repaints.
+            // The persona, the user's chosen name and the stored memory must be captured on the UI
+            // thread: the chat worker may not read mutable UI state while the main thread repaints.
             auto systemPrompt = personaSystemPrompt(persona, userName) + L"\n" + playbackContext() +
                                 L"聊天时可以自然带入当前播放的歌曲或这一句歌词，但不要编造歌词或播放"
                                 L"状态；需要完整歌词时先调用 music_get_lyrics。";
+            if (!extraSystem.empty())
+                systemPrompt += L"\n" + extraSystem;
             auto personaId = persona.id;
-            chatThread = std::thread([this, request, text = utf8(prompt),
+            auto memory = conversationHistory(conversation, 24);
+            bool compress = autoCompress;
+            int contextLimit = contextLimitTokens;
+            chatThread = std::thread([this, request, text = utf8(prompt), remember,
                                       systemPrompt = std::move(systemPrompt),
-                                      personaId = std::move(personaId)] {
+                                      personaId = std::move(personaId),
+                                      memory = std::move(memory), compress, contextLimit] {
                 Reply reply;
                 reply.request = request;
                 reply.type = "chat";
                 try {
                     Json confirmedLikes = Json::array();
                     Json createdPersonas = Json::array();
+                    auto config = loadAgentConfig();
+                    config.autoCompress = compress;
+                    if (contextLimit > 0)
+                        config.contextTokens = contextLimit;
                     auto outcome = runChatLoop(
-                        loadAgentConfig(), text,
+                        config, text,
                         [this, request, &confirmedLikes,
                          &createdPersonas](const std::string& name, const Json& args) {
                             // Persona creation stays in the terminal process: it is the player's
@@ -379,7 +652,7 @@ namespace mora {
                                 createdPersonas.push_back(result);
                             return result;
                         },
-                        {}, systemPrompt);
+                        {}, systemPrompt, memory);
                     reply.data = Json{{"ok", outcome.ok},
                                       {"code", outcome.code},
                                       {"error", outcome.error},
@@ -387,7 +660,14 @@ namespace mora {
                                       {"trace", outcome.trace},
                                       {"personaId", personaId},
                                       {"confirmedLikes", confirmedLikes},
-                                      {"createdPersonas", createdPersonas}};
+                                      {"createdPersonas", createdPersonas},
+                                      {"remember", remember},
+                                      {"user", text},
+                                      {"promptTokens", outcome.promptTokens},
+                                      {"contextLimitTokens", outcome.contextLimitTokens},
+                                      {"compressedMessages", outcome.compressedMessages},
+                                      {"compressionDegraded", outcome.compressionDegraded},
+                                      {"compressionCode", outcome.compressionCode}};
                     reply.text = utf8(outcome.text);
                 } catch (const std::exception& e) {
                     reply.type = "error";
@@ -406,7 +686,9 @@ namespace mora {
             std::wstring prompt = L"（系统提示）刚刚切到《" + track.name + L"》";
             if (!track.artist.empty())
                 prompt += L" - " + track.artist;
-            prompt += L"。请用当前人设的口吻，就这首歌给一句不超过 25 字、像在场一起听的反应；";
+            prompt += L"。请用当前人设的口吻，就这首歌给一句不超过 " +
+                      std::to_wstring(std::clamp(reactMaxChars, 10, 200)) +
+                      L" 字、像在场一起听的反应；";
             prompt += L"不要调用工具，不要复述这条系统提示。";
             auto state = session.audioState();
             if (!currentLyrics.instrumental && currentLyrics.songId == track.id) {
@@ -414,7 +696,8 @@ namespace mora {
                 if (index >= 0 && index < (int)currentLyrics.lines.size())
                     prompt += L"此刻歌词是「" + currentLyrics.lines[(size_t)index].text + L"」。";
             }
-            startChat(prompt, L"♪ " + (track.name.empty() ? std::wstring(L"换歌") : track.name));
+            startChat(prompt, L"♪ " + (track.name.empty() ? std::wstring(L"换歌") : track.name),
+                      false);
         }
         void goHome() {
             home = true;
@@ -570,15 +853,50 @@ namespace mora {
                     return;
                 }
                 if (verb == L"repeat") {
-                    if (!args.empty())
-                        session.setRepeat(args == L"off");
-                    action(A_Repeat);
+                    // Backward compatible switch: on maps to repeat_all, off to sequential, and the
+                    // bare form still toggles between those two.
+                    if (args.empty())
+                        applyQueueMode(session.repeat() ? QueueMode::Sequential
+                                                        : QueueMode::RepeatAll);
+                    else
+                        applyQueueMode(args == L"off" ? QueueMode::Sequential
+                                                      : QueueMode::RepeatAll);
                 } else {
                     if (!args.empty())
                         motion = args == L"off";
                     action(A_Motion);
                 }
-            } else if (verb == L"ai")
+            } else if (verb == L"mode") {
+                if (args.empty()) {
+                    cycleQueueMode();
+                } else {
+                    QueueMode parsed;
+                    if (!parseQueueMode(utf8(args), parsed)) {
+                        message(L"可用模式：sequential / repeat_all / repeat_one / shuffle");
+                        return;
+                    }
+                    applyQueueMode(parsed);
+                }
+            } else if (verb == L"detail")
+                openDetail();
+            else if (verb == L"stats") {
+                ListenPeriod period = statsPeriod;
+                if (!args.empty() && !parseListenPeriod(utf8(args), period)) {
+                    message(L"用法：/stats [day | month | year]");
+                    return;
+                }
+                loadStats(period);
+            } else if (verb == L"review") {
+                ListenPeriod period = statsPeriod;
+                if (!args.empty() && !parseListenPeriod(utf8(args), period)) {
+                    message(L"用法：/review [day | month | year]");
+                    return;
+                }
+                statsPeriod = period;
+                startReview();
+            } else if (verb == L"models")
+                startDiscovery(false);
+            else if (verb == L"ai")
                 modal = Modal::Ai;
             else if (verb == L"name") {
                 if (args.empty())
@@ -747,6 +1065,9 @@ namespace mora {
                     return;
                 }
                 session.assign(rows, selected);
+                session.setSource(collection ? (backMode == 2 ? "album" : "playlist")
+                                             : mode == 4 ? "library"
+                                             : mode == 5 ? "queue" : "search");
                 playCurrent();
             } else {
                 backRows = rows;
@@ -893,6 +1214,10 @@ namespace mora {
                 searchFocus = home || chatView;
                 return;
             }
+            if (detail) {
+                detail = false;
+                return;
+            }
             if (searchFocus) {
                 input.clear();
                 inputCursor = 0;
@@ -925,6 +1250,11 @@ namespace mora {
             search();
         }
         void action(int a) {
+            if (a >= A_ModelRow && a < A_ModelRow + 64) {
+                modelSelected = a - A_ModelRow;
+                adoptModel(modelSelected);
+                return;
+            }
             if (a >= A_Suggestion) {
                 auto suggestions = commandSuggestions(input);
                 int index = a - A_Suggestion;
@@ -1039,10 +1369,6 @@ namespace mora {
                 motion = !motion;
                 message(motion ? L"音频动效已开启" : L"音频动效已关闭");
                 break;
-            case A_Repeat:
-                session.setRepeat(!session.repeat());
-                message(session.repeat() ? L"循环播放已开启" : L"顺序播放");
-                break;
             case A_Help:
                 modal = Modal::Help;
                 break;
@@ -1101,6 +1427,75 @@ namespace mora {
                 break;
             case A_Device:
                 openDevicePicker();
+                break;
+            case A_Repeat:
+                applyQueueMode(session.repeat() ? QueueMode::Sequential : QueueMode::RepeatAll);
+                break;
+            case A_Mode:
+                cycleQueueMode();
+                break;
+            case A_Detail:
+                openDetail();
+                break;
+            case A_ReactToggle:
+                reactEnabled = !reactEnabled;
+                if (!reactEnabled)
+                    reactPending = false;
+                persistSetting([this](Settings& s) { s.reactEnabled = reactEnabled; });
+                if (reactEnabled)
+                    message(L"自发评价已开启 · 换歌时按设定间隔说一句（每首最多一次）");
+                else
+                    message(L"自发评价已关闭");
+                break;
+            case A_ReactSlower:
+                reactMinSeconds = std::min(600, reactMinSeconds + 5);
+                persistSetting([this](Settings& s) { s.reactMinSeconds = reactMinSeconds; });
+                message(L"评价间隔 · " + std::to_wstring(reactMinSeconds) + L" 秒");
+                break;
+            case A_ReactFaster:
+                reactMinSeconds = std::max(10, reactMinSeconds - 5);
+                persistSetting([this](Settings& s) { s.reactMinSeconds = reactMinSeconds; });
+                message(L"评价间隔 · " + std::to_wstring(reactMinSeconds) + L" 秒");
+                break;
+            case A_ReactCharsUp:
+                reactMaxChars = std::min(200, reactMaxChars + 5);
+                persistSetting([this](Settings& s) { s.reactMaxChars = reactMaxChars; });
+                message(L"评价字数 · 最多 " + std::to_wstring(reactMaxChars) + L" 字");
+                break;
+            case A_ReactCharsDown:
+                reactMaxChars = std::max(10, reactMaxChars - 5);
+                persistSetting([this](Settings& s) { s.reactMaxChars = reactMaxChars; });
+                message(L"评价字数 · 最多 " + std::to_wstring(reactMaxChars) + L" 字");
+                break;
+            case A_ReviewCharsUp:
+                reviewChars = std::min(4000, reviewChars + 100);
+                persistSetting([this](Settings& s) { s.reviewChars = reviewChars; });
+                message(L"锐评字数 · 约 " + std::to_wstring(reviewChars) + L" 字");
+                break;
+            case A_ReviewCharsDown:
+                reviewChars = std::max(200, reviewChars - 100);
+                persistSetting([this](Settings& s) { s.reviewChars = reviewChars; });
+                message(L"锐评字数 · 约 " + std::to_wstring(reviewChars) + L" 字");
+                break;
+            case A_CompressToggle:
+                autoCompress = !autoCompress;
+                persistSetting([this](Settings& s) { s.autoCompress = autoCompress; });
+                message(autoCompress ? L"对话记忆自动压缩已开启" : L"对话记忆自动压缩已关闭");
+                break;
+            case A_AiDiscover:
+                startDiscovery(true);
+                break;
+            case A_AiCached:
+                startDiscovery(false);
+                break;
+            case A_StatsDay:
+                loadStats(ListenPeriod::Day);
+                break;
+            case A_StatsMonth:
+                loadStats(ListenPeriod::Month);
+                break;
+            case A_StatsYear:
+                loadStats(ListenPeriod::Year);
                 break;
             case A_DeviceRow + 0:
             case A_DeviceRow + 1:
@@ -1363,6 +1758,167 @@ namespace mora {
             }
             return text + L"。";
         }
+        // Bounded projection of the authoritative queue. `position` is the absolute 0-based queue
+        // index so an adapter can act on a row without guessing, and `current` marks the row the
+        // player is on. Empty queues are a normal answer, not an error.
+        Json queueView(int offset, int limit) const {
+            const auto& tracks = session.tracks();
+            size_t begin = std::min<size_t>(static_cast<size_t>(std::max(0, offset)),
+                                            tracks.size());
+            size_t end = std::min<size_t>(tracks.size(), begin + static_cast<size_t>(limit));
+            Json items = Json::array();
+            for (size_t i = begin; i < end; ++i) {
+                const Track& track = tracks[i];
+                items.push_back(Json{{"position", (int)i},
+                                     {"id", track.id},
+                                     {"name", utf8(track.name)},
+                                     {"artist", utf8(track.artist)},
+                                     {"album", utf8(track.album)},
+                                     {"durationSeconds", track.duration},
+                                     {"current", i == session.index()}});
+            }
+            return Json{{"total", (int)tracks.size()},
+                        {"index", (int)session.index()},
+                        {"mode", queueModeName(session.mode())},
+                        {"repeat", session.repeat()},
+                        {"offset", std::max(0, offset)},
+                        {"limit", limit},
+                        {"items", items}};
+        }
+        // queue_edit: exactly one write per call. Out-of-range indices are rejected without
+        // modifying the queue, and a no-op (same index, same mode, from == to) reports
+        // changed:false instead of failing.
+        BridgeReply queueEdit(const Json& params) {
+            auto invalid = [](const std::string& text) {
+                return BridgeReply(false, "invalid_arguments", text, Json::object());
+            };
+            auto integerAt = [&params](const char* key, int fallback, bool& ok) {
+                if (!params.contains(key))
+                    return fallback;
+                if (!params[key].is_number_integer() || params[key].is_boolean()) {
+                    ok = false;
+                    return fallback;
+                }
+                return params[key].get<int>();
+            };
+            if (!params.is_object())
+                return invalid("queue_edit requires an object");
+            auto op = params.value("op", std::string());
+            bool ok = true;
+            bool changed = false;
+            if (op == "set_mode") {
+                if (!params.contains("mode") || !params["mode"].is_string())
+                    return invalid("mode is required");
+                QueueMode mode;
+                if (!parseQueueMode(params["mode"].get<std::string>(), mode))
+                    return invalid("mode must be sequential, repeat_all, repeat_one or shuffle");
+                bool seedOk = true;
+                bool seedGiven = params.contains("seed");
+                int seedValue = integerAt("seed", 1, seedOk);
+                if (!seedOk || seedValue < 1)
+                    return invalid("seed must be a positive integer");
+                QueueMode before = session.mode();
+                session.setMode(mode, static_cast<uint64_t>(seedValue));
+                // `changed` also reports an explicit-seed re-shuffle: the projection (mode/total/
+                // index) may look identical while the audible order really was rebuilt.
+                bool reshuffled =
+                    seedGiven && mode == QueueMode::Shuffle && session.queueSize() > 1;
+                changed = before != session.mode() || reshuffled;
+                if (before != session.mode())
+                    persistSetting([mode](Settings& s) { s.queueMode = mode; });
+            } else if (op == "play_index" || op == "remove" || op == "move") {
+                if (session.queueEmpty())
+                    return BridgeReply(false, "queue_boundary", "the queue is empty",
+                                       Json::object());
+                size_t size = session.queueSize();
+                if (op == "move") {
+                    int from = integerAt("from", -1, ok), to = integerAt("to", -1, ok);
+                    if (!ok || from < 0 || to < 0 || (size_t)from >= size || (size_t)to >= size)
+                        return invalid("from and to must be 0-based indices inside the queue");
+                    if (from != to) {
+                        session.moveTrack((size_t)from, (size_t)to);
+                        changed = true;
+                    }
+                } else {
+                    int index = integerAt("index", -1, ok);
+                    if (!ok || index < 0 || (size_t)index >= size)
+                        return invalid("index must be a 0-based index inside the queue");
+                    if (op == "play_index") {
+                        if ((size_t)index != session.index()) {
+                            session.playIndex((size_t)index);
+                            changed = true;
+                        }
+                    } else {
+                        session.removeIndex((size_t)index);
+                        changed = true;
+                    }
+                }
+            } else if (op == "clear") {
+                changed = !session.queueEmpty();
+                session.clearQueue();
+            } else if (op == "add_next" || op == "append" || op == "replace") {
+                // replace swaps the whole queue for the new set and starts its first row; append and
+                // add_next only add, so they can never throw away what is already queued.
+                size_t maxTracks = op == "replace" ? 100 : 50;
+                std::vector<Track> incoming;
+                if (params.contains("tracks")) {
+                    if (!params["tracks"].is_array())
+                        return invalid("tracks must be an array");
+                    for (const auto& item : params["tracks"]) {
+                        if (!item.is_object())
+                            return invalid("every track must be an object");
+                        int64_t id = item.value("id", (int64_t)0);
+                        if (id <= 0)
+                            return invalid("every track needs a positive id");
+                        Track track;
+                        track.id = id;
+                        track.name = unutf8(item.value("name", std::string()));
+                        track.artist = unutf8(item.value("artist", std::string()));
+                        track.album = unutf8(item.value("album", std::string()));
+                        track.duration = item.value("duration", 0);
+                        incoming.push_back(std::move(track));
+                    }
+                } else if (params.contains("ids")) {
+                    if (!params["ids"].is_array())
+                        return invalid("ids must be an array");
+                    for (const auto& item : params["ids"]) {
+                        if (!item.is_number_integer() || item.is_boolean())
+                            return invalid("ids must be positive integers");
+                        int64_t id = item.get<int64_t>();
+                        if (id <= 0)
+                            return invalid("ids must be positive integers");
+                        // Reuse the metadata of a row already in the queue; an unknown id still
+                        // enters as a placeholder and is filled by the normal details path.
+                        Track track{.id = id};
+                        for (const auto& row : session.tracks())
+                            if (row.id == id) {
+                                track = row;
+                                break;
+                            }
+                        incoming.push_back(std::move(track));
+                    }
+                } else
+                    return invalid("ids or tracks are required");
+                if (incoming.empty() || incoming.size() > maxTracks)
+                    return invalid(op == "replace" ? "1..100 tracks are required"
+                                                   : "1..50 tracks are required");
+                if (op == "replace") {
+                    session.assign(std::move(incoming), 0);
+                    changed = !session.queueEmpty();
+                    playCurrent();
+                } else
+                    changed =
+                        op == "add_next" ? session.playNext(incoming) : session.enqueue(incoming);
+            } else
+                return BridgeReply(false, "unknown_method", "unknown queue op: " + op,
+                                   Json::object());
+            Json view = queueView(0, 100);
+            view["applied"] = op;
+            view["changed"] = changed;
+            if (params.contains("metadataResolved"))
+                view["metadataResolved"] = params["metadataResolved"];
+            return BridgeReply(true, "", "", std::move(view));
+        }
         // Runs on the UI thread through BridgeServer::pump: adapters only ever describe intent,
         // the session stays owned here.
         BridgeReply control(const std::string& method, const Json& params) {
@@ -1382,6 +1938,21 @@ namespace mora {
                                         {"pid", (int64_t)GetCurrentProcessId()}});
             if (method == "status")
                 return BridgeReply(true, "", "", sessionView());
+            // Queue bridge for the MCP adapter and the model loop. Read-only listing never checks
+            // `busy`; edits are single operations that never retry and never touch the network.
+            if (method == "queue_list") {
+                int limit = 100, offset = 0;
+                if (params.contains("limit") && params["limit"].is_number_integer())
+                    limit = std::clamp(params["limit"].get<int>(), 1, 100);
+                if (params.contains("offset") && params["offset"].is_number_integer())
+                    offset = std::max(0, params["offset"].get<int>());
+                return BridgeReply(true, "", "", queueView(offset, limit));
+            }
+            if (method == "queue_edit") {
+                if (busy)
+                    return busyReply();
+                return queueEdit(params);
+            }
             if (method == "play") {
                 if (busy)
                     return busyReply();
@@ -1391,6 +1962,7 @@ namespace mora {
                     return BridgeReply(false, "invalid_arguments", "id must be a positive id",
                                        Json::object());
                 if (kind == "song") {
+                    session.setSource("agent");
                     session.assignId(id);
                     if (!playCurrent())
                         return busyReply();
@@ -1399,6 +1971,7 @@ namespace mora {
                 }
                 if (kind == "album" || kind == "playlist") {
                     lastPlayError.clear();
+                    session.setSource("agent");
                     int start = params.value("startIndex", 0);
                     if (start < 0 || start > 9999)
                         return BridgeReply(false, "invalid_arguments",
@@ -1553,6 +2126,43 @@ namespace mora {
                 if (k.wVirtualKeyCode == 'K') action(A_AiKey);
                 else if (k.wVirtualKeyCode == 'M') action(A_AiModel);
                 else if (k.wVirtualKeyCode == 'D') action(A_AiClearKey);
+                else if (k.wVirtualKeyCode == 'F') action(A_AiDiscover);
+                else if (k.wVirtualKeyCode == 'L') startDiscovery(false);
+                return;
+            }
+            if (modal == Modal::AiModels) {
+                if (k.wVirtualKeyCode == VK_UP)
+                    modelSelected = std::max(0, modelSelected - 1);
+                if (k.wVirtualKeyCode == VK_DOWN)
+                    modelSelected =
+                        std::min(std::max(0, (int)modelList.size() - 1), modelSelected + 1);
+                if (k.wVirtualKeyCode == VK_RETURN)
+                    adoptModel(modelSelected);
+                else if (k.wVirtualKeyCode == 'F')
+                    startDiscovery(true);
+                else if (k.wVirtualKeyCode == 'M')
+                    action(A_AiModel);
+                return;
+            }
+            if (modal == Modal::Stats) {
+                if (k.wVirtualKeyCode == VK_UP)
+                    statsScroll = std::max(0, statsScroll - 1);
+                else if (k.wVirtualKeyCode == VK_DOWN)
+                    ++statsScroll;
+                else if (k.wVirtualKeyCode == VK_PRIOR)
+                    statsScroll = std::max(0, statsScroll - 5);
+                else if (k.wVirtualKeyCode == VK_NEXT)
+                    statsScroll += 5;
+                else if (k.wVirtualKeyCode == VK_LEFT)
+                    loadStats((ListenPeriod)std::max(0, (int)statsPeriod - 1));
+                else if (k.wVirtualKeyCode == VK_RIGHT)
+                    loadStats((ListenPeriod)std::min(2, (int)statsPeriod + 1));
+                else if (k.wVirtualKeyCode == '1')
+                    loadStats(ListenPeriod::Day);
+                else if (k.wVirtualKeyCode == '2')
+                    loadStats(ListenPeriod::Month);
+                else if (k.wVirtualKeyCode == '3')
+                    loadStats(ListenPeriod::Year);
                 return;
             }
             if (modal == Modal::AiKey || modal == Modal::AiModel) {
@@ -1620,8 +2230,27 @@ namespace mora {
                     modal = Modal::None;
                 return;
             }
-            if (modal == Modal::Help || modal == Modal::Agent ||
-                modal == Modal::Settings)
+            if (modal == Modal::Settings) {
+                // One keystroke per preference, so the panel needs no nested selection state.
+                if (k.wVirtualKeyCode == 'R')
+                    action(A_ReactToggle);
+                else if (c == L'[')
+                    action(A_ReactFaster);
+                else if (c == L']')
+                    action(A_ReactSlower);
+                else if (c == L'-')
+                    action(A_ReactCharsDown);
+                else if (c == L'+' || c == L'=' || k.wVirtualKeyCode == VK_OEM_PLUS)
+                    action(A_ReactCharsUp);
+                else if (c == L',')
+                    action(A_ReviewCharsDown);
+                else if (c == L'.')
+                    action(A_ReviewCharsUp);
+                else if (k.wVirtualKeyCode == 'C')
+                    action(A_CompressToggle);
+                return;
+            }
+            if (modal == Modal::Help || modal == Modal::Agent)
                 return;
             if (modal == Modal::Phone || modal == Modal::Code) {
                 if (k.wVirtualKeyCode == VK_RETURN) {
@@ -1636,6 +2265,117 @@ namespace mora {
                 if (c >= L'0' && c <= L'9' && input.size() < 18)
                     input += c;
                 return;
+            }
+            if (detail) {
+                // The detail page owns scroll keys; everything else stays with the player so Esc,
+                // Space and the volume keys keep working while lyrics are open.
+                switch (k.wVirtualKeyCode) {
+                case VK_UP:
+                    detailFollow = false;
+                    detailScroll = std::max(0, detailScroll - 1);
+                    return;
+                case VK_DOWN:
+                    detailFollow = false;
+                    detailScroll += 1;
+                    return;
+                case VK_PRIOR:
+                    detailFollow = false;
+                    detailScroll = std::max(0, detailScroll - 5);
+                    return;
+                case VK_NEXT:
+                    detailFollow = false;
+                    detailScroll += 5;
+                    return;
+                case VK_HOME:
+                    detailFollow = false;
+                    detailScroll = 0;
+                    return;
+                case VK_END:
+                    detailFollow = false;
+                    detailScroll = (int)currentLyrics.lines.size();
+                    return;
+                case VK_RETURN:
+                    detailFollow = true;
+                    return;
+                case VK_SPACE:
+                    session.pause();
+                    return;
+                case VK_OEM_PLUS:
+                    session.adjustVolume(.05);
+                    return;
+                case VK_OEM_MINUS:
+                    session.adjustVolume(-.05);
+                    return;
+                default:
+                    return;
+                }
+            }
+            // One rule for every advertised page shortcut: while the composer is empty, the letters
+            // and digits printed on the frame act as the actions they name; as soon as there is any
+            // text, every printable character belongs to the composer. The homepage only honours the
+            // two shortcuts it actually advertises (1–5 and D) so a chat message typed there keeps
+            // working, while a browse/queue page offers its whole control row.
+            bool pageShortcut = !chatView && !detail && modal == Modal::None && input.empty() &&
+                                (home || !searchFocus);
+            if (pageShortcut) {
+                wchar_t letter = c ? c : (wchar_t)k.wVirtualKeyCode;
+                if (letter >= L'a' && letter <= L'z')
+                    letter = (wchar_t)(letter - L'a' + L'A');
+                if (k.wVirtualKeyCode == VK_SPACE) {
+                    action(A_Pause);
+                    return;
+                }
+                if (letter == L'D') {
+                    openDetail();
+                    return;
+                }
+                if (letter >= L'1' && letter <= L'5') {
+                    chooseMode(letter - L'0');
+                    return;
+                }
+                if (!home) {
+                    switch (letter) {
+                    case L'L':
+                        action(A_Login);
+                        return;
+                    case L'H':
+                        action(A_Like);
+                        return;
+                    case L'A':
+                        action(A_Save);
+                        return;
+                    case L'N':
+                        action(A_Next);
+                        return;
+                    case L'P':
+                        action(A_Previous);
+                        return;
+                    case L'V':
+                        action(A_Quality);
+                        return;
+                    case L'M':
+                        action(A_Motion);
+                        return;
+                    case L'C':
+                        action(A_Mode);
+                        return;
+                    case L'Q':
+                        quit = true;
+                        return;
+                    case L'?':
+                        action(A_Help);
+                        return;
+                    case L'+':
+                    case L'=':
+                        action(A_VolUp);
+                        return;
+                    case L'-':
+                        action(A_VolDown);
+                        return;
+                    default:
+                        break;
+                    }
+                }
             }
             if (searchFocus) {
                 auto suggestions = commandSuggestions(input);
@@ -1782,6 +2522,9 @@ namespace mora {
             case '4':
             case '5':
                 chooseMode(k.wVirtualKeyCode - '0');
+                break;
+            case 'D':
+                openDetail();
                 break;
             case 'L':
                 action(A_Login);
@@ -1971,6 +2714,7 @@ namespace mora {
             }
             if (completed && completed->request == activeChat && activeChat != 0) {
                 activeChat = 0;
+                chatWaiting = false;
                 if (completed->data.is_object()) {
                     for (const auto& item : completed->data.value("confirmedLikes", Json::array())) {
                         auto id = item.value("songId", (int64_t)0);
@@ -1997,8 +2741,45 @@ namespace mora {
                     auto answer = unutf8(completed->text);
                     if (!chatLog.empty())
                         chatLog.back().second = answer.empty() ? L"模型没有返回文字" : answer;
-                    message(L"模型已回复 · 音乐工具调用 " +
-                            std::to_wstring(completed->data.value("toolCalls", 0)) + L" 次");
+                    // Remember the turn only after a real answer, and only for requests the player
+                    // itself started (automatic reactions are not part of the user's memory).
+                    if (completed->data.value("remember", false)) {
+                        conversation.append("user", completed->data.value("user", std::string()));
+                        conversation.append("assistant", completed->text);
+                        if (!options.demo && options.seconds <= 0 && options.snapshot.empty())
+                            saveConversation(stateDirectory(), conversation);
+                    }
+                    lastPromptTokens = completed->data.value("promptTokens", (size_t)0);
+                    lastContextTokens = completed->data.value("contextLimitTokens", (size_t)0);
+                    int compressed = completed->data.value("compressedMessages", 0);
+                    // The degradation flag comes straight from the loop's own outcome; it is never
+                    // inferred from the summary text and never shown when no compression happened.
+                    bool degraded = completed->data.value("compressionDegraded", false);
+                    std::string degradeCode = completed->data.value("compressionCode", std::string());
+                    if (compressed > 0) {
+                        std::wstring note = L"（已压缩 " + std::to_wstring(compressed) +
+                                            L" 条早前对话 · 上下文 " +
+                                            std::to_wstring(lastPromptTokens) + L"/" +
+                                            std::to_wstring(lastContextTokens) + L" tokens）";
+                        if (degraded && !degradeCode.empty())
+                            note += L"（压缩降级：" + unutf8(degradeCode) + L"，已折叠 " +
+                                    std::to_wstring(compressed) + L" 条）";
+                        chatLog.push_back({L"", note});
+                        if (chatLog.size() > 8)
+                            chatLog.erase(chatLog.begin());
+                        message(L"对话记忆已压缩 " + std::to_wstring(compressed) +
+                                L" 条早期消息 · 请求 " + std::to_wstring(lastPromptTokens) +
+                                L"/" + std::to_wstring(lastContextTokens) + L" tokens" +
+                                (degraded && !degradeCode.empty()
+                                     ? L" · 压缩降级：" + unutf8(degradeCode)
+                                     : L""));
+                    } else
+                        message(L"模型已回复 · 音乐工具调用 " +
+                                std::to_wstring(completed->data.value("toolCalls", 0)) + L" 次" +
+                                (lastContextTokens
+                                     ? L" · 上下文 " + std::to_wstring(lastPromptTokens) + L"/" +
+                                           std::to_wstring(lastContextTokens)
+                                     : L""));
                 } else {
                     auto code = completed->data.value("code", std::string());
                     auto error = completed->data.value("error", std::string());
@@ -2011,6 +2792,7 @@ namespace mora {
         }
         void tick() {
             receive();
+            handleDiscoveryResult();
             mainCalls.pump([this](uint64_t owner, const std::string& method,
                                   const Json& params) {
                 if (!owner || owner != activeChat)
@@ -2082,12 +2864,17 @@ namespace mora {
             {
                 const Track& playing = session.playing();
                 auto now = Clock::now();
+                // The gap and the reply length come from the settings panel; the per-session cap is
+                // derived from the gap, so a listener can never turn the reaction into an
+                // unbounded request stream.
+                int gapSeconds = std::clamp(reactMinSeconds, 10, 600);
+                int sessionCap = std::max(4, 3600 / gapSeconds);
                 if (playing.id != reactSong) {
                     reactSong = playing.id;
                     reactPending = reactEnabled && !options.demo && playing.id && chatView &&
                                    !chatRunning && !busy && state.playing &&
-                                   now - lastReaction >= std::chrono::seconds(45) &&
-                                   reactCount < 40;
+                                   now - lastReaction >= std::chrono::seconds(gapSeconds) &&
+                                   reactCount < sessionCap;
                     if (reactPending)
                         lastReaction = now;
                 }
@@ -2098,6 +2885,29 @@ namespace mora {
                     ++reactCount;
                     reactToTrack(playing);
                 }
+            }
+            // Rotate the persona's waiting line while a model request is in flight instead of
+            // leaving one generic "contacting the model" string on screen.
+            if (chatWaiting && chatRunning && !chatLog.empty()) {
+                int index = (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      Clock::now() - waitLineSince)
+                                      .count() /
+                                  1500);
+                if (index != waitLineIndex) {
+                    waitLineIndex = index;
+                    chatLog.back().second = personaWaitLine(persona, index);
+                }
+            }
+            // The queue page mirrors the authoritative queue, so its entries and current row stay
+            // truthful even when playback advanced while the page stayed open.
+            if (mode == 5 && !home && !chatView && !detail && modal == Modal::None) {
+                rows = session.tracks();
+                total = (int)rows.size();
+                selected = std::clamp(selected, 0, std::max(0, total - 1));
+                if (selected < top)
+                    top = selected;
+                if (selected >= top + listH)
+                    top = selected - listH + 1;
             }
             if (!state.error.empty() && state.error != audioError) {
                 audioError = state.error;
@@ -2167,14 +2977,25 @@ namespace mora {
                             {cover.pixels[b], cover.pixels[b + 1], cover.pixels[b + 2]});
                 }
         }
+        // Homepage layout works from named bands instead of fixed rows: the composer owns the
+        // bottom of the screen, the now-playing card sits above it, the browse launchpad above
+        // that, and the character plus the right-hand column fill whatever is left. That is what
+        // keeps 78x24 and a wide window both readable without overlap.
         void drawHome(Canvas& c) {
             bool compact = height < 34 || width < 104;
-            bool shortWindow = height < 28;
-            int sw = compact ? (shortWindow ? 24 : 32) : personaAvatarWidth;
-            int sh = compact ? (shortWindow ? 26 : 34) : personaAvatarHeight;
+            int footerTop = height - 8;
+            constexpr int cardH = 4;
+            int cardTop = footerTop - cardH;
+            int browseY = cardTop - 2;
+            int contentBottom = browseY - 1;
+            int y = 2;
+            int maxRows = std::max(3, contentBottom - y + 1);
+            int desiredSh = compact ? (height < 28 ? 26 : 34) : personaAvatarHeight;
+            int sh = std::clamp(std::min(desiredSh, maxRows * 2), 8, personaAvatarHeight);
+            int sw = std::clamp(sh * personaAvatarWidth / personaAvatarHeight, 10,
+                                personaAvatarWidth);
             int x = compact ? 4 : std::max(4, (width - 91) / 2);
-            int y = 2, right = x + sw + (compact ? 5 : 7);
-            int textY = compact ? y : y + 3;
+            int right = x + sw + (compact ? 5 : 7);
             for (int row = 0; row < sh; row += 2)
                 for (int col = 0; col < sw; ++col) {
                     auto avatar = [&](int py) {
@@ -2192,32 +3013,97 @@ namespace mora {
                 L"█   █   ███   ████    ███ ", L"██ ██  █   █  █   █  █   █",
                 L"█ █ █  █   █  ████   █████", L"█   █  █   █  █  █   █   █",
                 L"█   █   ███   █   █  █   █"};
+            int ry = compact ? y + 1 : y + 3;
             for (int i = 0; i < 5; ++i)
-                c.text(right, textY + 1 + i, logo[i], colors.accent, width - right - 3);
-            c.text(right, textY + 7, L"云间 · " + persona.name + L"的音乐终端", colors.text,
-                   width - right - 3);
-            c.text(right, textY + 9, persona.greeting, colors.muted, width - right - 3);
-            if (!compact)
-                c.text(right, textY + 11, L"输入音乐需求 · / 查看全部命令", colors.muted,
-                       width - right - 3);
-            int quickY = compact ? textY + 12 : textY + 14;
-            if (quickY < height - 8)
-                c.button(right, quickY, std::min(36, width - right - 3), L"/search   搜索一首歌",
-                         A_Search);
-            if (quickY + 2 < height - 8)
-                c.button(right, quickY + 2, std::min(36, width - right - 3), L"/persona  切换人设",
-                         A_Persona);
-            if (quickY + 4 < height - 8)
-                c.button(right, quickY + 4, std::min(36, width - right - 3),
-                         L"/agent    接入外部 Agent", A_Agent);
-            if (!compact)
-                c.text(x + 13, y + sh / 2 + 1, persona.name, colors.muted, 30);
+                c.text(right, ry + i, logo[i], colors.accent, std::max(0, width - right - 3));
+            int nextY = ry + 6;
+            if (nextY <= contentBottom) {
+                c.text(right, nextY, L"云间 · " + persona.name + L"的音乐终端", colors.text,
+                       std::max(0, width - right - 3));
+                nextY += 2;
+            }
+            if (nextY <= contentBottom) {
+                c.text(right, nextY, persona.greeting, colors.muted,
+                       std::max(0, width - right - 3));
+                ++nextY;
+            }
+            if (nextY <= contentBottom && !compact) {
+                c.text(right, nextY, L"输入音乐需求 · / 查看全部命令", colors.muted,
+                       std::max(0, width - right - 3));
+                ++nextY;
+            }
+            const std::array<std::pair<std::wstring, int>, 3> quick{
+                std::pair{L"/search   搜索一首歌", A_Search},
+                std::pair{L"/persona  切换人设", A_Persona},
+                std::pair{L"/agent    接入外部 Agent", A_Agent}};
+            for (const auto& [label, action] : quick) {
+                if (nextY > contentBottom)
+                    break;
+                c.button(right, nextY, std::min(36, std::max(0, width - right - 3)), label, action);
+                nextY += 2;
+            }
+            // Browse launchpad: one compact row, clickable and reachable with 1-5 on the keyboard.
+            if (browseY >= 5) {
+                c.text(4, browseY, L"浏览", colors.muted, 4);
+                const std::array<std::pair<std::wstring, int>, 5> entries{
+                    std::pair{L"1 单曲", A_Songs},      std::pair{L"2 专辑", A_Albums},
+                    std::pair{L"3 歌单", A_Playlists}, std::pair{L"4 我的音乐", A_Library},
+                    std::pair{L"5 队列", A_Queue}};
+                int bx = 10;
+                for (const auto& [label, action] : entries) {
+                    int w = displayWidth(label) + 2;
+                    if (bx + w > width - 16)
+                        break;
+                    c.button(bx, browseY, w, label, action);
+                    bx += w + 2;
+                }
+                if (width >= 96)
+                    c.button(width - 16, browseY, 12, L"D 详情", A_Detail);
+                else if (bx + 12 <= width - 2)
+                    c.button(bx, browseY, 12, L"D 详情", A_Detail);
+                if (width >= 100)
+                    c.button(width - 32, browseY, 14, L"/search 搜索", A_Search);
+            }
+            // Now-playing card: cover, title, artist/album, progress, quality and queue mode. With
+            // no track it still explains what will appear here instead of going blank.
             auto state = session.audioState();
-            if (state.playing)
-                c.text(4, height - 9,
-                       L"♫ " + truncate(session.playing().name, width - 30) +
-                           (state.paused ? L"  ·  PAUSED" : L"  ·  PLAYING"),
-                       colors.accent, width - 8);
+            if (cardTop >= 6) {
+                c.rect(4, cardTop, width - 8, cardH, colors.surface);
+                drawCover(c, 4, cardTop, 8, cardH);
+                int tx = 14;
+                int tw = std::max(8, width - tx - 4);
+                const Track& track = session.playing();
+                if (track.id) {
+                    c.text(tx, cardTop, L"♪ " + (track.name.empty() ? L"载入曲目…" : track.name),
+                           colors.accent, tw);
+                    std::wstring sub = track.artist;
+                    if (!track.album.empty())
+                        sub += (sub.empty() ? L"" : L" · ") + track.album;
+                    c.text(tx, cardTop + 1, sub.empty() ? L"—" : sub, colors.text, tw);
+                    double duration =
+                        state.duration > 0 ? state.duration : (double)track.duration;
+                    c.text(tx, cardTop + 2,
+                           timeText(state.position) + L" / " + timeText(duration) + L" · " +
+                               actualQualityLabel() + L" · " + modeLabel(session.mode()),
+                           colors.muted, tw);
+                    int pw = std::min(tw, 40);
+                    if (pw > 4) {
+                        double ratio = duration > 0 ? std::clamp(state.position / duration, 0.0, 1.0)
+                                                    : 0.0;
+                        int filled = (int)(pw * ratio);
+                        for (int i = 0; i < pw; ++i)
+                            c.pixel(tx + i, cardTop + 3, i == filled ? L'●' : L'─',
+                                    i <= filled ? colors.accent : colors.muted, colors.surface);
+                    }
+                } else {
+                    c.text(tx, cardTop, L"♪ 还没有正在播放的歌曲", colors.accent, tw);
+                    c.text(tx, cardTop + 1, L"Enter 播放 · /search 搜一首，或 1–5 浏览",
+                           colors.text, tw);
+                    c.text(tx, cardTop + 2,
+                           L"音质 " + qualityLabel() + L" · " + modeLabel(session.mode()),
+                           colors.muted, tw);
+                }
+            }
         }
         void drawChat(Canvas& c) {
             c.text(4, 5, persona.name + L" · " + persona.tagline, colors.accent, width - 8);
@@ -2283,10 +3169,12 @@ namespace mora {
             c.mark(3, y + 1, width - 6, A_Row - 1);
             c.mark(3, y + 2, width - 6, A_Row - 1);
             c.text(4, y - 1, (busy ? L"◌ " : L"· ") + status, colors.muted, width - 8);
-            c.text(4, height - 2,
-                   searchFocus ? L"Enter 发送  ·  / 命令  ·  Tab 补全  ·  ↑↓ 历史  ·  Esc 返回"
-                               : L"↑↓ 选择  ·  Enter 播放  ·  / 命令  ·  Tab 输入  ·  /home 首页",
-                   colors.muted, width - 20);
+            std::wstring hint =
+                detail ? L"↑↓ 滚动歌词  ·  Enter 回到当前行  ·  Space 暂停  ·  Esc 返回"
+                : searchFocus
+                    ? L"Enter 发送  ·  / 命令  ·  Tab 补全  ·  ↑↓ 历史  ·  Esc 返回"
+                    : L"↑↓ 选择  ·  Enter 播放  ·  / 命令  ·  Tab 输入  ·  /home 首页";
+            c.text(4, height - 2, hint, colors.muted, width - 20);
             c.text(width - 14, height - 2,
                    std::to_wstring((int)(session.volume() * 100)) + L"% VOL", colors.accent,
                    10);
@@ -2314,6 +3202,120 @@ namespace mora {
                 c.text(6, panelY + count + 1, L"╰─ " + suggestions[suggestion].usage, colors.muted,
                        panelW - 4);
             }
+        }
+        // Two compact rows shared by every browse/queue page: a small cover plus the live track,
+        // duration, quality and queue mode. It stays truthful when nothing is playing.
+        void drawRouteNowPlaying(Canvas& c) {
+            auto state = session.audioState();
+            const Track& track = session.playing();
+            drawCover(c, 3, 4, 8, 2);
+            int tx = 13, tw = std::max(10, width - tx - 4);
+            if (track.id) {
+                std::wstring title = L"♪ " + (track.name.empty() ? L"载入曲目…" : track.name);
+                if (!track.artist.empty())
+                    title += L" — " + track.artist;
+                c.text(tx, 4, title, colors.accent, tw);
+                double duration = state.duration > 0 ? state.duration : (double)track.duration;
+                std::wstring detail;
+                if (!track.album.empty())
+                    detail = track.album + L" · ";
+                detail += timeText(state.position) + L" / " + timeText(duration) + L" · " +
+                          actualQualityLabel() + L" · " + modeLabel(session.mode());
+                c.text(tx, 5, detail, colors.muted, tw);
+            } else {
+                c.text(tx, 4, L"♪ 还没有正在播放的歌曲", colors.accent, tw);
+                c.text(tx, 5, L"音质 " + qualityLabel() + L" · " + modeLabel(session.mode()),
+                       colors.muted, tw);
+            }
+        }
+        // Song detail page: cover, metadata and scrollable lyrics. Instrumental, not-yet-loaded and
+        // unavailable lyrics each say what they are instead of showing an empty box.
+        void drawDetail(Canvas& c) {
+            const Track& track = session.playing();
+            auto state = session.audioState();
+            c.text(4, 3, L"歌曲详情", colors.accent, 20);
+            c.button(width - 13, 3, 10, L"D 关闭", A_Back);
+            int coverW = std::clamp(width / 7, 10, 22), coverH = std::clamp(height / 4, 3, 10);
+            drawCover(c, 4, 5, coverW, coverH);
+            int tx = 4 + coverW + 3, tw = std::max(10, width - tx - 4);
+            if (track.id) {
+                c.text(tx, 5, track.name.empty() ? L"载入曲目…" : track.name, colors.accent, tw);
+                c.text(tx, 6, track.artist.empty() ? L"—" : track.artist, colors.text, tw);
+                c.text(tx, 7, track.album.empty() ? L"—" : track.album, colors.muted, tw);
+                double duration = state.duration > 0 ? state.duration : (double)track.duration;
+                std::wstring format =
+                    state.sampleRate ? L" · " + std::to_wstring(state.sampleRate / 1000) + L"k/" +
+                                           std::to_wstring(state.sampleBits) + L"bit"
+                                     : L"";
+                c.text(tx, 8, L"时长 " + timeText(duration) + L" · " + actualQualityLabel() + format,
+                       colors.muted, tw);
+                c.text(tx, 9,
+                       L"队列 第 " + std::to_wstring((int)session.index() + 1) + L"/" +
+                           std::to_wstring((int)session.tracks().size()) + L" 首 · " +
+                           modeLabel(session.mode()),
+                       colors.muted, tw);
+            } else {
+                c.text(tx, 5, L"还没有正在播放的歌曲", colors.accent, tw);
+                c.text(tx, 6, L"按 /search 搜一首，Enter 播放后这里会显示封面与歌词。", colors.text,
+                       tw);
+                c.text(tx, 8, L"音质 " + qualityLabel() + L" · " + modeLabel(session.mode()),
+                       colors.muted, tw);
+            }
+            enum class LyricState { Ready, Loading, Instrumental, Unavailable, Empty };
+            LyricState ls = LyricState::Loading;
+            if (!track.id)
+                ls = LyricState::Empty;
+            else if (currentLyrics.instrumental)
+                ls = LyricState::Instrumental;
+            else if (currentLyrics.unavailable)
+                ls = LyricState::Unavailable;
+            else if (currentLyrics.songId == track.id && !currentLyrics.lines.empty())
+                ls = LyricState::Ready;
+            int lyricTop = std::max(5 + coverH + 1, 12);
+            int bottom = std::max(lyricTop + 2, height - 8);
+            std::wstring header = L"歌词";
+            if (ls == LyricState::Instrumental)
+                header += L" · 纯音乐，没有歌词";
+            else if (ls == LyricState::Unavailable)
+                header += L" · 歌词暂不可用";
+            else if (ls == LyricState::Loading)
+                header += L" · 歌词尚未加载";
+            else if (ls == LyricState::Ready)
+                header += L" · 当前行高亮 · ↑↓ 滚动";
+            c.line(4, lyricTop, width - 8, colors.surface);
+            c.text(4, lyricTop, L" " + header + L" ", colors.accent, width - 10);
+            int first = lyricTop + 1, visible = std::max(1, bottom - first);
+            if (ls == LyricState::Ready) {
+                int lines = (int)currentLyrics.lines.size();
+                int live = lyricIndexAt(currentLyrics, state.position);
+                if (detailFollow && live >= 0)
+                    detailScroll = std::max(0, live - visible / 2);
+                detailScroll = std::clamp(detailScroll, 0, std::max(0, lines - visible));
+                for (int i = 0; i < visible; ++i) {
+                    int index = detailScroll + i;
+                    if (index >= lines)
+                        break;
+                    bool current = index == live;
+                    if (current)
+                        c.rect(4, first + i, width - 8, 1, colors.surface);
+                    c.text(4, first + i,
+                           (current ? L"▶ " : L"  ") + currentLyrics.lines[(size_t)index].text,
+                           current ? colors.accent : colors.muted, width - 8);
+                    if (current && !currentLyrics.lines[(size_t)index].translation.empty() &&
+                        width >= 108)
+                        c.text(width / 2 + 2, first + i,
+                               currentLyrics.lines[(size_t)index].translation, colors.text,
+                               width / 2 - 8);
+                }
+            } else if (ls == LyricState::Loading)
+                c.text(4, first, L"歌词正在加载，稍等一下就回来。", colors.muted, width - 10);
+            else if (ls == LyricState::Instrumental)
+                c.text(4, first, L"这首歌是纯音乐，没有歌词。", colors.muted, width - 10);
+            else if (ls == LyricState::Unavailable)
+                c.text(4, first, L"接口没有返回歌词（可能受版权限制），这里如实说明。", colors.muted,
+                       width - 10);
+            else
+                c.text(4, first, L"先播一首歌，再回来看歌词。", colors.muted, width - 10);
         }
         void drawModal(Canvas& c) {
             int x = std::max(2, (width - 62) / 2), w = std::min(62, width - 4),
@@ -2372,11 +3374,41 @@ namespace mora {
                 c.text(x + 4, y + 7, input + L"▏", colors.accent, w - 8);
                 txt(10, L"Enter 保存 · 1–24 个字符");
             } else if (modal == Modal::Settings) {
-                txt(2, L"个人设置");
-                txt(5, L"聊天称呼：" + (userName.empty() ? L"尚未设置" : userName));
-                c.button(x + 3, y + 7, w - 6, L"修改我的名字", A_Name);
-                c.button(x + 3, y + 9, w - 6, L"切换音乐 Agent 人设", A_Persona);
-                c.button(x + 3, y + 11, w - 6, L"重看新手引导", A_Guide);
+                txt(1, L"个人设置");
+                // One row per preference with inline buttons, so the panel still fits a 78x24
+                // window instead of pushing half the settings off the bottom.
+                auto setting = [&](int row, std::wstring_view label, const std::wstring& value,
+                                   RGB color) {
+                    c.text(x + 3, y + row, label, colors.muted, w - 22);
+                    c.text(x + 3 + displayWidth(label), y + row, value, color, w - 22);
+                };
+                setting(2, L"聊天称呼：", userName.empty() ? L"尚未设置" : userName, colors.text);
+                c.button(x + w - 12, y + 2, 9, L"修改", A_Name);
+                setting(3, L"人设：", persona.name, colors.text);
+                c.button(x + w - 12, y + 3, 9, L"切换", A_Persona);
+                setting(4, L"自发评价：", reactEnabled ? L"已开启" : L"已关闭",
+                        reactEnabled ? colors.accent : colors.muted);
+                c.button(x + w - 12, y + 4, 9, L"R 切换", A_ReactToggle);
+                setting(5, L"评价间隔：", std::to_wstring(reactMinSeconds) + L" 秒", colors.text);
+                c.button(x + w - 17, y + 5, 7, L"更慢", A_ReactSlower);
+                c.button(x + w - 8, y + 5, 7, L"更快", A_ReactFaster);
+                setting(6, L"评价字数：", std::to_wstring(reactMaxChars) + L" 字", colors.text);
+                c.button(x + w - 17, y + 6, 7, L"更短", A_ReactCharsDown);
+                c.button(x + w - 8, y + 6, 7, L"更长", A_ReactCharsUp);
+                setting(7, L"锐评字数：", std::to_wstring(reviewChars) + L" 字", colors.text);
+                c.button(x + w - 17, y + 7, 7, L"更短", A_ReviewCharsDown);
+                c.button(x + w - 8, y + 7, 7, L"更长", A_ReviewCharsUp);
+                setting(8, L"记忆压缩：", autoCompress ? L"自动" : L"关闭",
+                        autoCompress ? colors.accent : colors.muted);
+                c.button(x + w - 12, y + 8, 9, L"C 切换", A_CompressToggle);
+                setting(9, L"上下文上限：",
+                        contextLimitTokens > 0 ? std::to_wstring(contextLimitTokens) + L" tokens"
+                                               : L"自动（按端点报告）",
+                        colors.muted);
+                c.button(x + w - 12, y + 10, 9, L"引导", A_Guide);
+                c.text(x + 3, y + 10, L"重看新手引导", colors.muted, w - 20);
+                c.text(x + 3, y + h - 1, L"R 评价开关 · [ ] 间隔 · - + 字数 · , . 锐评 · C 压缩",
+                       colors.muted, w - 6);
             } else if (modal == Modal::Persona) {
                 txt(2, L"选择音乐 Agent 人设");
                 int rows = std::min((int)personaList.size(), std::max(1, h - 9));
@@ -2395,6 +3427,15 @@ namespace mora {
                     c.button(x + 3, y + 5 + i * 2, w - 6, truncate(label, w - 10),
                              A_PersonaRow + index, index == personaSelected);
                 }
+                // Preview the exact line this persona says while a model request is in flight.
+                int previewY = y + h - 3;
+                int lastButton = y + 5 + (rows - 1) * 2;
+                if (personaSelected < (int)personaList.size() && previewY > lastButton + 1)
+                    c.text(x + 3, previewY,
+                           truncate(L"等待语：" +
+                                        personaWaitLine(personaList[(size_t)personaSelected], 0),
+                                    w - 6),
+                           colors.muted, w - 6);
             } else if (modal == Modal::Device) {
                 txt(2, L"选择音频输出设备");
                 int rows = std::min((int)outputList.size(), std::max(1, h - 9));
@@ -2442,6 +3483,8 @@ namespace mora {
                                                   L"/play [序号] /pause /next /prev",
                                                   L"/like 红心   /add 收藏   /quality 音质",
                                                   L"/queue 队列   /library 我的歌单",
+                                                  L"/mode 队列模式   /detail 歌曲详情与歌词",
+                                                  L"/stats 听歌统计   /review 听歌锐评   /models 模型目录",
                                                   L"/home 首页   /ai 模型接口   /agent MCP",
                                                   L"/persona 人设   /effort 思考强度   /name 称呼",
                                                   L"/audio-device 音频输出   /settings 个人设置",
@@ -2463,7 +3506,7 @@ namespace mora {
                     txt(8, L"只能播放账号实际有权限的音乐；稍后登录也可以。");
                 } else {
                     txt(4, L"【可选：音乐 Agent】想用 /chat 聊天时，再配置模型。");
-                    txt(6, L"输入 /ai，按 K 填密钥、按 M 选择模型 ID。");
+                    txt(6, L"输入 /ai，按 K 填密钥、按 M 选模型，或按 F 从端点发现模型。");
                     txt(8, L"密钥保存在当前 Windows 用户的加密文件中。");
                 }
                 c.button(x + 3, y + 10, w - 6,
@@ -2476,11 +3519,133 @@ namespace mora {
                 txt(3, L"人设：" + persona.name + L" · " + persona.tagline);
                 txt(4, L"思考强度：" + effortLabel(config.reasoningEffort));
                 txt(5, L"模型：" + truncate(unutf8(config.model), w - 12));
-                txt(6, agentKeyPresent() ? L"密钥：本机已配置（DPAPI 保护）" : L"密钥：本机未配置");
-                c.button(x + 3, y + 8, w - 6, L"K  输入或替换模型密钥", A_AiKey);
-                c.button(x + 3, y + 9, w - 6, L"M  修改模型 ID", A_AiModel);
-                c.button(x + 3, y + 10, w - 6, L"D  清除本机模型密钥", A_AiClearKey);
-                txt(11, L"/chat 对话；环境变量可覆盖模型设置。");
+                txt(6, config.contextTokens
+                           ? L"上下文：" + std::to_wstring(config.contextTokens) + L" tokens" +
+                                 (contextLimitTokens ? L"（本地设定同值）" : L"")
+                           : L"上下文：端点未报告（按回退值）");
+                txt(7, agentKeyPresent() ? L"密钥：本机已配置（DPAPI 保护）" : L"密钥：本机未配置");
+                if (!config.modelModalities.empty()) {
+                    std::wstring modes;
+                    for (const auto& mode : config.modelModalities) {
+                        if (!modes.empty())
+                            modes += L" / ";
+                        modes += unutf8(mode);
+                    }
+                    txt(8, L"模态（端点报告，不可手选）：" + truncate(modes, w - 30));
+                }
+                if (lastContextTokens)
+                    txt(9, L"上次请求：" + std::to_wstring(lastPromptTokens) + L"/" +
+                              std::to_wstring(lastContextTokens) + L" tokens");
+                int half = (w - 8) / 2;
+                c.button(x + 3, y + 10, half, L"K  设置模型密钥", A_AiKey);
+                c.button(x + 5 + half, y + 10, half, L"M  修改模型 ID", A_AiModel);
+                c.button(x + 3, y + 11, half, L"D  清除本机密钥", A_AiClearKey);
+                c.button(x + 5 + half, y + 11, half, L"F  从端点发现模型", A_AiDiscover);
+                c.button(x + 3, y + 12, w - 6, L"L  查看已缓存的模型目录", A_AiCached);
+                if (h > 16)
+                    txt(14, L"/chat 对话；模态只按端点报告展示，用户不能手选。");
+            } else if (modal == Modal::AiModels) {
+                txt(1, modelFromCache ? L"已缓存的模型目录" : L"端点发现的模型");
+                txt(2, L"共 " + std::to_wstring(modelList.size()) +
+                           L" 个 · ↑↓ 选择，Enter 采用（模态只报告）");
+                int rows = std::max(1, h - 6);
+                int from = std::clamp(modelSelected - rows + 1, 0,
+                                      std::max(0, (int)modelList.size() - rows));
+                for (int i = 0; i < rows; ++i) {
+                    int index = from + i;
+                    if (index >= (int)modelList.size())
+                        break;
+                    const auto& capability = modelList[(size_t)index];
+                    std::wstring label = (index == modelSelected ? L"❯ " : L"  ") +
+                                         unutf8(capability.id);
+                    label += L"  ·  ctx " + (capability.contextTokens
+                                                  ? std::to_wstring(capability.contextTokens)
+                                                  : std::wstring(L"?"));
+                    label += L" · out " + (capability.maxOutputTokens
+                                               ? std::to_wstring(capability.maxOutputTokens)
+                                               : std::wstring(L"?"));
+                    if (!capability.inputModalities.empty()) {
+                        label += L" · ";
+                        for (size_t m = 0; m < capability.inputModalities.size(); ++m) {
+                            if (m)
+                                label += L"+";
+                            label += unutf8(capability.inputModalities[m]);
+                        }
+                    }
+                    if (capability.reasoning)
+                        label += L" · 推理";
+                    c.button(x + 3, y + 4 + i, w - 6, truncate(label, w - 10),
+                             A_ModelRow + index, index == modelSelected);
+                }
+                txt(h - 2, L"Enter 采用 · F 重新发现 · M 手填 · Esc 返回");
+            } else if (modal == Modal::Stats) {
+                std::wstring periodName = statsPeriod == ListenPeriod::Day      ? L"日"
+                                          : statsPeriod == ListenPeriod::Month  ? L"月"
+                                                                                : L"年";
+                txt(1, L"听歌统计 · " + periodName +
+                           (statsReport.key.empty() ? L"" : L"（" + unutf8(statsReport.key) + L"）"));
+                std::vector<std::wstring> lines;
+                if (statsReport.plays == 0) {
+                    lines.push_back(L"这个周期还没有听歌记录。");
+                    lines.push_back(L"播放几首歌后，这里会显示次数、时长、Top 歌曲与歌手。");
+                } else {
+                    lines.push_back(L"播放 " + std::to_wstring(statsReport.plays) + L" 次 · 时长 " +
+                                    durationText(statsReport.listenedSeconds) + L" · 完整 " +
+                                    std::to_wstring(statsReport.completedPlays) + L" · 跳过 " +
+                                    std::to_wstring(statsReport.skippedPlays));
+                    lines.push_back(L"独立歌曲 " + std::to_wstring(statsReport.uniqueSongs) +
+                                    L" · 独立歌手 " + std::to_wstring(statsReport.uniqueArtists));
+                    lines.push_back(L"");
+                    if (!statsReport.topSongs.empty()) {
+                        lines.push_back(L"Top 歌曲");
+                        size_t rank = 1;
+                        for (const auto& row : statsReport.topSongs)
+                            lines.push_back(L"  " + std::to_wstring(rank++) + L". " +
+                                            unutf8(row.label) + L"  ·  " +
+                                            std::to_wstring(row.plays) + L" 次");
+                    }
+                    if (!statsReport.topArtists.empty()) {
+                        lines.push_back(L"");
+                        lines.push_back(L"Top 歌手");
+                        size_t rank = 1;
+                        for (const auto& row : statsReport.topArtists)
+                            lines.push_back(L"  " + std::to_wstring(rank++) + L". " +
+                                            unutf8(row.label) + L"  ·  " +
+                                            std::to_wstring(row.plays) + L" 次");
+                    }
+                    if (!statsReport.byHour.empty()) {
+                        lines.push_back(L"");
+                        lines.push_back(L"时段分布");
+                        int64_t peak = 0;
+                        for (const auto& hour : statsReport.byHour)
+                            peak = std::max(peak, hour.plays);
+                        std::wstring bars;
+                        static const wchar_t* levels = L"▁▂▃▄▅▆▇█";
+                        for (const auto& hour : statsReport.byHour) {
+                            int level = peak > 0 ? (int)(hour.plays * 7 / peak) : 0;
+                            bars += levels[std::clamp(level, 0, 7)];
+                        }
+                        lines.push_back(L"  0 时 " + bars + L" 23 时");
+                    }
+                }
+                int rows = std::max(1, h - 7);
+                statsScroll = std::clamp(statsScroll, 0,
+                                         std::max(0, (int)lines.size() - rows));
+                for (int i = 0; i < rows; ++i) {
+                    int index = statsScroll + i;
+                    if (index >= (int)lines.size())
+                        break;
+                    c.text(x + 3, y + 4 + i, truncate(lines[(size_t)index], w - 6),
+                           index == 0 ? colors.text : colors.muted, w - 6);
+                }
+                int third = (w - 10) / 3;
+                c.button(x + 3, y + h - 3, third, L"1 日", A_StatsDay,
+                         statsPeriod == ListenPeriod::Day);
+                c.button(x + 5 + third, y + h - 3, third, L"2 月", A_StatsMonth,
+                         statsPeriod == ListenPeriod::Month);
+                c.button(x + 7 + third * 2, y + h - 3, third, L"3 年", A_StatsYear,
+                         statsPeriod == ListenPeriod::Year);
+                txt(h - 2, L"↑↓ 滚动 · ← → 切换周期 · Esc 返回");
             } else if (modal == Modal::AiKey || modal == Modal::AiModel) {
                 bool secret = modal == Modal::AiKey;
                 txt(2, secret ? L"输入模型密钥" : L"输入模型 ID");
@@ -2492,7 +3657,7 @@ namespace mora {
             } else if (modal == Modal::Agent) {
                 txt(2, L"外部 Agent · MCP stdio（已接通）");
                 txt(5, L"启动入口：mora --mcp");
-                txt(7, L"工具：搜索/集合/播放/控制/推荐/随机/歌单/红心/收藏/状态");
+                txt(7, L"工具：搜索/集合/播放/控制/队列/推荐/随机/歌单/红心/收藏/状态");
                 txt(9, L"播放类工具要求先在本机运行 mora（单实例）。");
                 txt(11, L"外部 Agent 不需要播放器内的模型 Key。");
                 txt(13, L"写工具只作用于用户明确给出的目标，不自动重试。");
@@ -2514,11 +3679,18 @@ namespace mora {
             listW = sidePanel ? width * 59 / 100 : width - 6;
             listX = 3;
             listY = 8;
-            listH = std::max(2, height - 22);
+            listH = std::max(2, height - 23);
             c->text(3, 1, L"M O R A", colors.accent);
             c->text(15, 1, L"云间  /  STEREO TERMINAL", colors.muted);
             std::wstring mem = std::to_wstring((int)memoryMB()) + L" MB";
             c->text(width - 26, 1, options.demo ? L"DEMO · 离线演示" : mem, colors.muted, 22);
+            if (detail) {
+                drawDetail(*c);
+                drawComposer(*c);
+                if (modal != Modal::None)
+                    drawModal(*c);
+                return c;
+            }
             if (home) {
                 drawHome(*c);
                 drawComposer(*c);
@@ -2541,22 +3713,34 @@ namespace mora {
                     drawModal(*c);
                 return c;
             }
+            // Now-playing band, then the list title and the list itself. The band is always drawn,
+            // so an empty queue still says what is playing (or that nothing is) instead of blank.
+            drawRouteNowPlaying(*c);
             c->text(3, 6, truncate(title + (query.empty() ? L"" : L" / " + query), listW - 22),
                     colors.accent);
             c->text(std::max(20, listW - 14), 6,
                     std::to_wstring(rows.size()) + L" / " + std::to_wstring(total), colors.muted,
                     18);
+            if (mode == 5) {
+                std::wstring summary = L"队列 " + std::to_wstring(total) + L" 首";
+                if (total > 0)
+                    summary += L" · 当前 " + std::to_wstring((int)session.index() + 1) + L"/" +
+                               std::to_wstring(total);
+                summary += L" · " + modeLabel(session.mode());
+                c->text(3, 7, truncate(summary, width - 20), colors.accent, width - 20);
+            } else
+                c->text(3, 7, L"Enter 播放 · D 歌曲详情与歌词 · [ ] 翻页", colors.muted, width - 20);
+            c->button(width - 13, 7, 10, L"D 详情", A_Detail);
             for (int i = 0; i < listH && top + i < (int)rows.size(); ++i) {
                 int index = top + i;
                 auto& t = rows[index];
                 int y = listY + i;
                 bool sel = index == selected;
                 c->rect(listX, y, listW, 1, sel ? colors.surface : colors.background);
-                c->text(4, y,
-                        session.playing().id && t.id == session.playing().id
-                            ? L"▸"
-                            : std::to_wstring(offset + index + 1),
-                        sel ? colors.accent : colors.muted, 4);
+                bool current = mode == 5 ? (int)session.index() == index
+                                         : (session.playing().id && t.id == session.playing().id);
+                c->text(4, y, current ? L"▸" : std::to_wstring(offset + index + 1),
+                        sel || current ? colors.accent : colors.muted, 4);
                 int nameWidth = listW * 50 / 100;
                 auto name = t.name.empty() ? L"载入曲目… #" + std::to_wstring(t.id) : t.name;
                 c->text(9, y, name, sel ? colors.accent : colors.text, nameWidth - 2);
@@ -2567,30 +3751,51 @@ namespace mora {
                         likes.contains(t.id) ? colors.accent : colors.muted, 5);
             }
             if (rows.empty()) {
-                c->text(7, 13, L"从一首歌开始。", colors.text, listW - 12);
-                c->text(7, 15, L"/ 输入「歌名 歌手」搜索元数据", colors.muted, listW - 12);
-                c->text(7, 17, L"2 搜专辑 · 3 搜歌单 · L 登录账号", colors.muted, listW - 12);
+                std::vector<std::wstring> empty;
+                if (mode == 5)
+                    empty = {L"队列里还没有歌曲", L"/search 搜一首，Enter 播放后会进入队列",
+                             L"也可以 2 专辑 / 3 歌单 / 4 我的音乐"};
+                else if (mode == 4)
+                    empty = {L"我的音乐还没有载入", L"按 L 登录网易云账号后重试",
+                             L"登录后这里会列出你创建和收藏的歌单"};
+                else
+                    empty = {L"还没有内容", L"/ 输入「歌名 歌手」搜索", L"1 单曲 · 2 专辑 · 3 歌单"};
+                for (size_t i = 0; i < empty.size() && (int)i < listH; ++i)
+                    c->text(7, listY + (int)i, truncate(empty[i], listW - 12),
+                            i == 0 ? colors.text : colors.muted, listW - 12);
             }
+            int controlY = height - 12;
             if (sidePanel) {
                 int x = listW + 7, w = width - x - 4, artH = std::clamp(height - 28, 4, 12),
                     artW = std::min(artH * 2, w);
                 drawCover(*c, x + (w - artW) / 2, 8, artW, artH);
                 int y = 9 + artH;
-                c->text(x, y, session.playing().id ? session.playing().name : L"尚未播放",
-                        colors.text, w);
-                c->text(x, y + 2, session.playing().artist, colors.muted, w);
-                c->text(x, y + 3, session.playing().album, colors.muted, w);
-                std::wstring format = state.sampleRate
-                                          ? L" · " + std::to_wstring(state.sampleRate / 1000) +
-                                                L"k / " + std::to_wstring(state.sampleBits) + L"bit"
-                                          : L"";
+                const Track& track = session.playing();
+                c->text(x, y, track.id ? track.name : L"尚未播放", colors.text, w);
+                c->text(x, y + 2, track.id && !track.artist.empty() ? track.artist : L"—",
+                        colors.muted, w);
+                c->text(x, y + 3, track.id && !track.album.empty() ? track.album : L"—",
+                        colors.muted, w);
+                std::wstring format =
+                    state.sampleRate ? L" · " + std::to_wstring(state.sampleRate / 1000) + L"k/" +
+                                           std::to_wstring(state.sampleBits) + L"bit"
+                                     : L"";
                 c->text(x, y + 4,
-                        session.actualQuality().empty()
-                            ? L"READY / 按 Enter 播放"
-                            : unutf8(session.actualQuality()) + format,
+                        actualQualityLabel() + format + L" · " + modeLabel(session.mode()),
                         colors.accent, w);
+                std::wstring lyric;
+                if (track.id && currentLyrics.songId == track.id) {
+                    if (currentLyrics.instrumental)
+                        lyric = L"♪ 纯音乐，没有歌词";
+                    else {
+                        int index = lyricIndexAt(currentLyrics, state.position);
+                        if (index >= 0 && index < (int)currentLyrics.lines.size())
+                            lyric = L"♪ " + currentLyrics.lines[(size_t)index].text;
+                    }
+                }
+                if (!lyric.empty() && y + 6 < controlY - 2)
+                    c->text(x, y + 6, truncate(lyric, w), colors.accent, w);
             }
-            int controlY = height - 12;
             c->line(3, controlY - 2, width - 6, colors.surface);
             c->text(3, controlY - 1,
                     (state.paused    ? L"PAUSED"
@@ -2613,7 +3818,7 @@ namespace mora {
             c->button(33, controlY + 1, 10, L"H 红心", A_Like);
             c->button(44, controlY + 1, 10, L"A 收藏", A_Save);
             c->button(55, controlY + 1, 10, L"V 音质", A_Quality);
-            c->button(66, controlY + 1, 9, session.repeat() ? L"C 循环" : L"C 顺序", A_Repeat);
+            c->button(66, controlY + 1, 9, L"C " + modeLabel(session.mode()), A_Mode);
             if (width >= 94) {
                 c->button(width - 15, controlY + 1, 5, L"-", A_VolDown);
                 c->button(width - 9, controlY + 1, 5, L"+", A_VolUp);
@@ -2668,9 +3873,17 @@ namespace mora {
                     (modal == Modal::Login && (a == A_Qr || a == A_Phone || a == A_Logout)) ||
                     ((modal == Modal::Phone || modal == Modal::Code) && a == A_Send) ||
                     (modal == Modal::Save && a >= A_SaveRow && a < A_QualityRow) ||
-                    (modal == Modal::Settings && (a == A_Name || a == A_Persona)) ||
+                    (modal == Modal::Settings &&
+                     (a == A_Name || a == A_Persona || a == A_Guide || a == A_ReactToggle ||
+                      a == A_ReactSlower || a == A_ReactFaster || a == A_ReactCharsDown ||
+                      a == A_ReactCharsUp || a == A_ReviewCharsDown || a == A_ReviewCharsUp ||
+                      a == A_CompressToggle)) ||
                     (modal == Modal::Ai &&
-                     (a == A_AiKey || a == A_AiModel || a == A_AiClearKey)) ||
+                     (a == A_AiKey || a == A_AiModel || a == A_AiClearKey || a == A_AiDiscover ||
+                      a == A_AiCached)) ||
+                    (modal == Modal::AiModels && a >= A_ModelRow && a < A_ModelRow + 64) ||
+                    (modal == Modal::Stats &&
+                     (a == A_StatsDay || a == A_StatsMonth || a == A_StatsYear)) ||
                     (modal == Modal::Persona && a >= A_PersonaRow && a < A_DeviceRow) ||
                     (modal == Modal::Device && a >= A_DeviceRow) ||
                     (modal == Modal::Quality && a >= A_QualityRow);
@@ -2754,7 +3967,14 @@ namespace mora {
                 motion = options.motion && settings.motion;
                 session.setVolume(settings.volume);
                 session.setQuality(settings.quality);
-                session.setRepeat(settings.repeat);
+                // The queue mode is authoritative; `repeat` is only the legacy mirror.
+                session.setMode(settings.queueMode);
+                reactEnabled = settings.reactEnabled;
+                reactMinSeconds = settings.reactMinSeconds;
+                reactMaxChars = settings.reactMaxChars;
+                reviewChars = settings.reviewChars;
+                autoCompress = settings.autoCompress;
+                contextLimitTokens = settings.contextLimitTokens;
                 history = std::move(settings.history);
                 userName = std::move(settings.userName);
                 guideDone = settings.guideDone;
@@ -2773,9 +3993,15 @@ namespace mora {
                                               });
                     found != outputList.end())
                     audio.selectOutputDevice(settings.outputDeviceId);
+                // Conversation memory and the listen log live in the same user directory. The sink
+                // is attached before any track can start, so no listen is lost.
+                conversation = loadConversation(stateDirectory());
+                listenHistory = std::make_unique<ListenHistory>(stateDirectory());
+                session.attachListenSink(listenHistory.get());
+                session.setSource("search");
             }
             applyPersonaColors();
-            status = L"预览版 0.6.0 · /search 搜歌 · /login 登录 · /persona 人设 · /ai 模型接口";
+            status = L"预览版 0.7.0 · /search 搜歌 · /login 登录 · /persona 人设 · /ai 模型接口";
             if (options.demo) {
                 std::array<std::array<std::wstring, 3>, 8> songs{
                     {{L"晴天", L"周杰伦", L"叶惠美"},
@@ -2818,6 +4044,7 @@ namespace mora {
                                 std::filesystem::absolute(options.localAudio).filename().wstring(),
                             .artist = L"本地音频验收"};
                 session.assign({local});
+                session.setSource("local");
                 session.startTrack(local, "",
                                    std::filesystem::absolute(options.localAudio).wstring());
             }
@@ -2826,6 +4053,10 @@ namespace mora {
             mainCalls.close();
             if (chatThread.joinable())
                 chatThread.join();
+            if (discoverThread.joinable())
+                discoverThread.join();
+            if (listenHistory)
+                listenHistory->flush();
         }
         int run() {
             if (!console.interactive() && options.seconds <= 0 && options.snapshot.empty()) {
@@ -2908,6 +4139,13 @@ namespace mora {
                 settings.volume = session.volume();
                 settings.quality = session.quality();
                 settings.repeat = session.repeat();
+                settings.queueMode = session.mode();
+                settings.reactEnabled = reactEnabled;
+                settings.reactMinSeconds = reactMinSeconds;
+                settings.reactMaxChars = reactMaxChars;
+                settings.reviewChars = reviewChars;
+                settings.autoCompress = autoCompress;
+                settings.contextLimitTokens = contextLimitTokens;
                 settings.motion = motion;
                 settings.history = std::move(history);
                 settings.userName = userName;

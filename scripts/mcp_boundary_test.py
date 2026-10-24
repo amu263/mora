@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='mcp-boundary-', dir=ROOT / 'build') as 
             'music_search', 'music_open_collection', 'music_play', 'music_control',
             'music_now_playing', 'music_get_lyrics', 'music_recommend', 'music_play_random',
             'music_list_playlists', 'music_set_like', 'music_add_to_playlist',
-            'music_get_status'},
+            'music_get_status', 'music_queue_list', 'music_queue_edit'},
               'advertised tools match the implemented contract')
         check(code(responses[4]) == -32600, 'duplicate initialize cannot reset session')
         status = responses[5].get('result', {}).get('structuredContent', {})

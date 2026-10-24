@@ -6,9 +6,9 @@
 
 | 工具 | 状态 | 输入 | 输出/约束 |
 | --- | --- | --- | --- |
-| `music_search` | 已接通 | query, kind, limit, offset | 真实元数据，最多 30 条；无 Cookie、播放 URL；不自动播放 |
+| `music_search` | 已接通 | query, kind, limit, offset | 真实元数据，最多 30 条；无 Cookie、播放 URL；不自动播放。歌手/风格/场景/心情类系列请求：`limit 10..30` 取回一组 id，再用 `music_queue_edit(op="replace", ids=[…])` 建 5..20 首队列 |
 | `music_open_collection` | 已接通 | kind(album/playlist), id, offset, limit | 按需曲目页（最多 100 条），只返回 ID/名称/时长，不返回播放地址，不自动播放 |
-| `music_play` | 已接通（需 TUI） | kind(song/album/playlist), id, startIndex | 提交到**同一个** TUI 播放会话；song 用该曲替换队列，album/playlist 用集合替换队列并从 startIndex 开始；返回 accepted，真实播放状态用 `music_now_playing` 查询；无播放器时 `needs_player` |
+| `music_play` | 已接通（需 TUI） | kind(song/album/playlist), id, startIndex | 提交到**同一个** TUI 播放会话；song 用该曲替换队列，album/playlist 用**整个集合替换队列**并从 startIndex 开始（整张专辑/歌单走这里）；返回 accepted，真实播放状态用 `music_now_playing` 查询；无播放器时 `needs_player` |
 | `music_control` | 已接通（需 TUI） | action(pause/resume/next/previous/seek/volume), value | 修改同一会话；seek 单位为秒，volume 为 0..100；不创建第二个播放器；无播放器时 `needs_player` |
 | `music_now_playing` | 已接通（需 TUI） | 空对象 | 真实状态：曲目、队列位置、暂停、进度、音量、循环、账号实际获得的音质与采样率 |
 | `music_get_status` | 已接通 | 空对象 | 能力清单 + `playerSessionAttached` + 当前会话快照；未连接时必须为 false |
@@ -17,8 +17,87 @@
 | `music_add_to_playlist` | 已接通（真实账号；真实入库待用户指定歌单） | songId, playlistId, operationId | 只允许自己拥有的歌单（先校验再写，否则 `no_permission`）；重复映射 `already_present`；不自动重试 |
 | `music_recommend` | 已接通（M5） | intent, source(auto/search/playlists), limit, seed | 有真实 ID 的候选与理由；**绝不播放、不收藏**；返回 `candidateSetId` |
 | `music_play_random` | 已接通（M5） | candidateSetId 或 intent, seed | 从实际候选随机挑一首（排除正在播放的），提交给播放器；不会自动换曲重试 |
+| `music_queue_list` | 已接通（M8；需 TUI） | limit ≤ 100, offset | 只读投影当前队列：`total`、0 基 `index`、`mode`、`repeat`、有界行窗口（`id/name/artist/album/durationSeconds/current`）；不返回流地址或 Cookie |
+| `music_queue_edit` | 已接通（M8；需 TUI） | op, mode, seed, index, from, to, id, ids | 单次一个写操作：`set_mode/play_index/remove/move/clear/add_next/append/replace`；索引 **0 基**，与 `music_play.startIndex` 相同；越界与未知字段 `invalid_arguments`；无播放器 `needs_player`；不自动重试 |
 
 工具级失败（参数非法、没有播放器、播放器忙）返回 `result.isError:true`，并在 `structuredContent` 给出机器可读的 `error`：`invalid_arguments`、`needs_player`、`busy`、`queue_boundary`、`unknown_method`、`disconnected`。协议层错误（未知工具、畸形 JSON-RPC）仍是 JSON-RPC error。
+
+## 队列与播放模式（M8）
+
+两个工具和 `music_control` 走**同一条**路径：播放器在跑就把意图交给同一个 `PlaybackSession`；没有播放器就如实返回 `needs_player`。适配器不保存队列副本，也不启动第二个播放核心。
+
+### `music_queue_list`（只读）
+
+- 参数：`limit`（1..100，默认 100）、`offset`（0..10000，默认 0，**0 基**）。
+- 返回：`{total, index, mode, repeat, offset, limit, items[]}`。
+  - `total` 是队列真实长度；`index` 是**当前播放行**的 0 基下标；`mode` 取 `sequential` / `repeat_all` / `repeat_one` / `shuffle`。
+  - `items` 是有界窗口，每行 `{position（0 基绝对下标）, id, name, artist, album, durationSeconds, current}`；`current` 恰好一行是 `true`（队列非空时）。
+  - 为控制返回体大小，最多投影队列前 100 行；`offset` 是在这个有界窗口内的偏移。`total` 始终是完整队列长度。
+- 只读：不改播放状态、不写账号、不返回流地址或 Cookie。空队列返回 `total:0, items:[]`，仍带 `mode`/`index`。
+
+### `music_queue_edit`（每次调用一个写操作）
+
+- 参数白名单：`op, mode, seed, index, from, to, id, ids`；出现其他字段 → `invalid_arguments`。
+- `op` 取值与语义：
+
+| op | 额外参数 | 语义 |
+| --- | --- | --- |
+| `set_mode` | `mode`（必填）、`seed`（可选 ≥1） | 常用播放器语义：`sequential` 顺序播完即停、`repeat_all` 列表循环、`repeat_one` 单曲循环、`shuffle` 随机。`mode` 先经 `parseQueueMode` 解析，因此 `random`/`loop`/`single`/`normal` 等别名也接受，回传的始终是 canonical 名。带 `seed` 时随机顺序可复现。 |
+| `play_index` | `index`（必填，0 基） | 跳转到队列某一行开始播放；与 `music_play.startIndex` 同一基准。 |
+| `remove` | `index`（必填，0 基） | 删除一行；当前行在被删行之后会前移一位，删到队尾则回退到新的最后一行。 |
+| `move` | `from`、`to`（必填，0 基） | 把一行移动到新位置；正在播放的行跟着自己的**内容**走，而不是留在旧下标。 |
+| `clear` | 无 | 清空整个队列并停止。 |
+| `replace` | `id` 或 `ids`（二选一，最多 100） | **换成这一组**：整队被替换成给定歌曲并从**第一首**开始播放。系列请求（歌手/风格/场景/心情）一次取回 5..20 首后用它建立队列，避免“只播一首”。 |
+| `add_next` | `id` 或 `ids`（二选一） | “下一首插播”：把歌曲插到当前曲目之后，**保留**原有队列。 |
+| `append` | `id` 或 `ids`（二选一） | 追加到队尾，**保留**原有队列。 |
+
+- `ids` 上限：`replace` 为 100，`add_next`/`append` 为 50；`id` 与 `ids` 同时出现 → `invalid_arguments`。
+- 返回新的队列投影：`{op, changed, total, index, mode, repeat, items[]}`；`replace`/`add_next`/`append` 额外返回 `requestedIds` 与 `metadataResolved`（`false` 表示只拿到 id、歌名等元数据缺失，播放器会经既有刷新流程补全，**不会编造歌名**）。
+- **已知行为**：`music_play(kind=song)` 入队的当前行元数据（歌名/歌手/专辑/时长）**可能延迟到详情刷新**才出现；`replace`/`add_next`/`append` 由适配器随 `tracks:[{id,name,artist,album,duration}]` 一并送入，通常立即带元数据。两种情况下 id 都是真实的，模型不得据空字段编造曲目信息。
+- 越界索引（`index >= total`）→ `invalid_arguments`，且**不产生部分写入**；`play_index` 指向当前行是幂等 no-op。未知 `op`、缺少必填参数、类型错误都在接触播放器之前拒绝。
+- 单次调用只发一个写操作，服务端不自动重试；`busy`（播放器正在受理别的请求）如实上报，由调用方决定是否再发一次。
+- **`changed` 与随机序**：`op=set_mode` 带**显式 `seed`**、mode=shuffle 且队列 >1 首时，即使 mode/index 未变也回 `changed:true`（语义=可听顺序被重建）；其余情况 `changed` 表示 mode/total/index/行顺序投影是否变化。因此 **`changed:false` 不能等价于“走序未变”**：不带 seed 的重复 `set_mode shuffle` 仍可能重排（`PlaybackSession::setMode` 在 `seed != 0` 时重建，未给 seed 时按默认 1），而回包仍是 `changed:false`。同一 seed + 相同起始行可复现；任何一次 `next`（含播放自然结束的推进）都会消耗随机序，因此可复现性只在没有其它推进者时成立。
+- **随机序回归检查**：`python scripts/m8_queue_check.py --shuffle-forensics`（exit 0 = 同一 seed 在 5 条不同前序路径下走序一致且 `changed` 语义正确；exit 1 = 回归），报告 `docs/verification/m8-shuffle-forensics.json`。
+
+### 替换 vs 追加（模型必须靠描述做对选择）
+
+| 用户说 | 正确操作 | 结果 |
+| --- | --- | --- |
+| “换成/只听/播放这张专辑” | `music_play(kind=album\|playlist)` 或 `music_queue_edit(op="replace", ids=[…])` | 队列被整组替换，从第一首播放 |
+| “再加上/再来点/接着放/排在后面” | `music_queue_edit(op="append")` 或 `op="add_next"` | 原有队列保留，只增不换 |
+
+### 系列播放常识（写进工具描述、供模型遵循）
+
+- **整张专辑/整个歌单**：`music_play(kind=album|playlist, id)` 或 `music_open_collection` → 替换队列并播放整个集合。
+- **歌手/风格/场景/心情**（没有明确专辑）：先 `music_search(query=关键词, limit 10..30)` 取回一组 id，再 `music_queue_edit(op="replace", ids=[…])` 一次建立 5..20 首的队列并从第一首播放。**只播一首属于缺陷**。
+- **模糊请求**（“随便来点歌”）：`music_recommend` → `music_play_random`（或 `op="replace"` 用候选建队列），不要反问。
+- 工具返回 `accepted` 只表示已提交；真实播放状态必须用 `music_now_playing` 确认，不得编造。
+
+### 示例
+
+```json
+{"name": "music_queue_list", "arguments": {"limit": 20, "offset": 0}}
+{"name": "music_queue_edit", "arguments": {"op": "set_mode", "mode": "shuffle", "seed": 42}}
+{"name": "music_queue_edit", "arguments": {"op": "play_index", "index": 3}}
+{"name": "music_queue_edit", "arguments": {"op": "add_next", "id": 539928216}}
+{"name": "music_queue_edit", "arguments": {"op": "replace", "ids": [1, 2, 3, 4, 5]}}
+{"name": "music_queue_edit", "arguments": {"op": "append", "ids": [1, 2, 3]}}
+{"name": "music_queue_edit", "arguments": {"op": "remove", "index": 0}}
+{"name": "music_queue_edit", "arguments": {"op": "move", "from": 4, "to": 1}}
+{"name": "music_queue_edit", "arguments": {"op": "clear"}}
+```
+
+无播放器时：
+
+```json
+{"isError": true, "structuredContent": {"ok": false, "error": "needs_player", "message": "no MORA player is attached; run mora in a terminal first"}}
+```
+
+参数非法时（无播放器也一样，校验发生在探活之前）：
+
+```json
+{"isError": true, "structuredContent": {"ok": false, "error": "invalid_arguments", "message": "index must be 0..9999"}}
+```
 
 ## 推荐与随机播放（M5）
 
@@ -39,6 +118,7 @@
 - **只读联网也走播放器**：`music_search` / `music_open_collection` 在已连接时由 TUI 执行（复用它的账号会话与节流），只有 `needs_player` / `disconnected` 时才回退到 MCP 进程内只读联网。因此有播放器时 MCP 不持有第二个 HTTP/TLS 栈（实测 MCP 工作集 14.74 → 9.20 MB）。
 - 桥接支持**延迟应答**：TUI 收到适配器请求后可以把它交给网络工作线程，完成后再回帧（服务端等待上限 30s，客户端对联网方法用 25s 超时）；不会阻塞 UI 主循环。
 - 适配器任务用独立 ticket 关联，错误回复同样按 ticket 唤醒等待帧；UI 侧的取消只丢 UI 任务，不影响正在等待的适配器。
+- **队列方法**（M8）：`queue_list`（只读，`{limit,offset}` → `{total,index,mode,repeat,items[]}`）与 `queue_edit`（`{op,mode?,seed?,index?,from?,to?,ids?,tracks?}`）。`replace`/`add_next`/`append` 由适配器先把 id 解析成 `tracks:[{id,name,artist,album,duration}]` 再一并送出，UI 线程只做队列写入、不发起网络请求；解析不到元数据时仍以真实 id 占位入队。两者都不创建第二个播放器。
 - **关闭宿主（MCP 进程）不停止播放**：播放器生命周期由 TUI 决定，退出 TUI 才停止音频。这样不会留下孤儿后台进程，也不会让宿主一退出就静音。
 - 播放控制的状态变化是异步的（音频线程处理命令，约 100ms）。`music_play`/`music_control` 返回 accepted 与即时快照，调用方应轮询 `music_now_playing` 确认最终状态。
 
@@ -61,7 +141,7 @@
 - 当前兼容协商版本：2025-11-25、2025-06-18、2025-03-26、2024-11-05。
 - 单条输入最大 64 KiB，输出有限，不发送完整媒体内容。
 - 协议错误用 JSON-RPC error；工具执行失败用 `result.isError:true`。
-- 没有 TUI 时，只读工具（search/open_collection/get_status/list_playlists）照常可用，播放类工具与**全部写工具**返回 `needs_player`；`playerSessionAttached` 必须为 false。写工具先探活播放器，绝不回退到适配器本地网络；未知结果不重试，`operationId` 只用于宿主自身去重。
+- 没有 TUI 时，只读工具（search/open_collection/get_status/list_playlists）照常可用，播放类工具、`music_queue_list` 与**全部写工具**（含 `music_queue_edit`）返回 `needs_player`；`playerSessionAttached` 必须为 false。写工具先探活播放器，绝不回退到适配器本地网络；未知结果不重试，`operationId` 只用于宿主自身去重。
 
 ## 外部 Agent 配置示例
 

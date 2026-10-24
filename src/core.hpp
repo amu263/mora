@@ -11,9 +11,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mora {
@@ -62,14 +64,36 @@ namespace mora {
     double matchScore(const Track& track, std::wstring_view query);
     bool playable(const Json& item);
     bool isRiskCode(int code);
+    // Queue behaviour shared by the terminal UI, the MCP adapter and the model loop. `Shuffle`
+    // keeps playing (it wraps over the same permutation when a pass ends, so next()/previous()
+    // stay invertible and an explicit seed is reproducible); `RepeatOne` replays the current row,
+    // and `Sequential` stops at the last row.
+    enum class QueueMode { Sequential, RepeatAll, RepeatOne, Shuffle };
+    const char* queueModeName(QueueMode mode);
+    bool parseQueueMode(std::string_view value, QueueMode& out);
+    const std::vector<QueueMode>& queueModes();
     struct Queue {
         std::vector<Track> tracks;
         size_t index = 0;
-        bool repeat = false;
+        QueueMode mode = QueueMode::Sequential;
+        // Deterministic permutation so a shuffled order can be reproduced in tests and by the agent.
+        std::vector<size_t> shuffleOrder;
+        size_t shuffleCursor = 0;
         void assign(std::vector<Track> items, size_t selected = 0);
         Track* current();
         bool next();
         bool previous();
+        bool repeat() const { return mode == QueueMode::RepeatAll || mode == QueueMode::RepeatOne; }
+        void setRepeat(bool value);
+        // Shuffle enabled mid-track keeps the current row as the first pick instead of restarting it.
+        void setMode(QueueMode value, uint64_t seed = 1);
+        void rebuildShuffle(uint64_t seed);
+        bool setIndex(size_t value);
+        bool removeAt(size_t value);
+        bool moveTrack(size_t from, size_t to);
+        void clear();
+        bool append(std::vector<Track> items);
+        bool insertNext(std::vector<Track> items);
     };
     struct RGB {
         int r = 0, g = 0, b = 0;

@@ -172,7 +172,7 @@ if (!(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'licenses')) -and
 [IO.File]::WriteAllText($shimFile, $shim, [Text.Encoding]::ASCII)
 $record = [ordered]@{
     applicationId='mora-player'; installRoot=$installRoot; commandFile=$shimFile
-    commandDirProvided=[bool]$CommandDir; version='0.6.0-preview'
+    commandDirProvided=[bool]$CommandDir; version='0.7.0-preview'
 }
 [IO.File]::WriteAllText($installRecord, ($record | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
 if (!$CommandDir) {

@@ -24,7 +24,7 @@ assert '\x1b' not in result.stdout
 responses=[json.loads(line) for line in result.stdout.splitlines()]
 assert len(responses)==(7 if live else 6),responses
 assert responses[0]['result']['protocolVersion']=='2025-11-25'
-assert {t['name'] for t in responses[1]['result']['tools']}=={'music_search','music_open_collection','music_play','music_control','music_now_playing','music_get_lyrics','music_recommend','music_play_random','music_list_playlists','music_set_like','music_add_to_playlist','music_get_status'}
+assert {t['name'] for t in responses[1]['result']['tools']}=={'music_search','music_open_collection','music_play','music_control','music_now_playing','music_get_lyrics','music_recommend','music_play_random','music_list_playlists','music_set_like','music_add_to_playlist','music_get_status','music_queue_list','music_queue_edit'}
 assert responses[2]['result']['structuredContent']['playerSessionAttached'] is False
 assert responses[3]['error']['code']==-32602
 assert responses[4]['result']['isError'] is True

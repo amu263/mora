@@ -31,6 +31,12 @@ namespace mora {
         Json searchTool(std::wstring query, Kind kind, int offset, int limit);
         Json collectionTool(const std::string& kind, int64_t id, int offset, int limit);
         Json libraryTool(bool ownedOnly);
+        // Queue reads/writes ride the same bridge as music_control: the running player owns the
+        // one queue, so the adapter only projects and never keeps a private copy.
+        Json queueState(const Json& data) const;
+        // Resolve song ids into queue rows before an insert. Metadata is a nicety: an id without
+        // detail still becomes a row (the player fills it in later); nothing is ever fabricated.
+        std::vector<Track> queueTracks(const std::vector<int64_t>& ids);
         // Lyrics are cached per song on the calling side, not here: the adapter must stay thin.
         Json lyricsTool(int64_t songId, bool includeTranslation, int maxLines);
         std::string rememberCandidates(std::vector<Candidate> picked);

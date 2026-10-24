@@ -3,6 +3,7 @@
 #include "audio.hpp"
 #include "bridge.hpp"
 #include "commands.hpp"
+#include "context.hpp"
 #include "core.hpp"
 #include "mascot.hpp"
 #include "mcp.hpp"
@@ -11,6 +12,7 @@
 #include "recommend.hpp"
 #include "session.hpp"
 #include "settings.hpp"
+#include "stats.hpp"
 #include "ui.hpp"
 #include "ui_tool_calls.hpp"
 #include "worker.hpp"
@@ -89,9 +91,126 @@ int main() {
     queue.assign({good, other}, 1);
     CHECK(queue.current()->id == 2);
     CHECK(!queue.next());
-    queue.repeat = true;
+    queue.setRepeat(true);
     CHECK(queue.next() && queue.current()->id == 1);
     CHECK(queue.previous() && queue.current()->id == 2);
+    // M8: explicit queue modes, and the queue edits a music player is expected to expose.
+    {
+        // Every mode name round-trips, and a listener's own words are accepted too.
+        for (auto mode : queueModes()) {
+            QueueMode parsed{};
+            CHECK(parseQueueMode(queueModeName(mode), parsed) && parsed == mode);
+        }
+        QueueMode parsed{};
+        CHECK(parseQueueMode("random", parsed) && parsed == QueueMode::Shuffle);
+        CHECK(parseQueueMode("loop_one", parsed) && parsed == QueueMode::RepeatOne);
+        CHECK(!parseQueueMode("nonsense", parsed));
+
+        Queue sequential;
+        sequential.assign({good, other, Track{.id = 3}}, 0);
+        CHECK(sequential.next() && sequential.current()->id == 2);
+        CHECK(sequential.next() && sequential.current()->id == 3);
+        CHECK(!sequential.next() && sequential.current()->id == 3); // the end stops the queue
+
+        Queue loop;
+        loop.assign({good, other, Track{.id = 3}}, 2);
+        loop.setMode(QueueMode::RepeatAll);
+        CHECK(loop.next() && loop.current()->id == 1); // wraps to the first row
+        CHECK(loop.previous() && loop.current()->id == 3);
+
+        Queue single;
+        single.assign({good, other}, 0);
+        single.setMode(QueueMode::RepeatOne);
+        CHECK(single.next() && single.current()->id == 1); // same row: the caller replays it
+        CHECK(single.previous() && single.current()->id == 1);
+
+        // Shuffle is reproducible for a given seed and never stops on a non-empty queue.
+        Queue one, two;
+        one.assign({good, other, Track{.id = 3}, Track{.id = 4}}, 0);
+        two.assign({good, other, Track{.id = 3}, Track{.id = 4}}, 0);
+        one.setMode(QueueMode::Shuffle, 7);
+        two.setMode(QueueMode::Shuffle, 7);
+        std::vector<int64_t> orderOne, orderTwo;
+        for (int i = 0; i < 6; ++i) {
+            one.next();
+            two.next();
+            orderOne.push_back(one.current()->id);
+            orderTwo.push_back(two.current()->id);
+        }
+        CHECK(orderOne == orderTwo);
+        CHECK(orderOne.size() == 6 && one.current()->id != 0);
+        // Enabling shuffle on a playing track keeps that track as the first pick.
+        Queue mid;
+        mid.assign({good, other, Track{.id = 3}}, 1);
+        mid.setMode(QueueMode::Shuffle, 3);
+        CHECK(mid.current()->id == 2);
+        CHECK(mid.next() && mid.current()->id != 2);
+        // A full shuffle pass wraps over the same order, so stepping back is an exact inverse: a
+        // failed playback can roll one step back without changing the order the caller asked for.
+        Queue wrap;
+        wrap.assign({good, other, Track{.id = 3}}, 0);
+        wrap.setMode(QueueMode::Shuffle, 9);
+        std::vector<int64_t> pass;
+        for (int i = 0; i < 3; ++i) {
+            wrap.next();
+            pass.push_back(wrap.current()->id);
+        }
+        wrap.next(); // the pass ended and wrapped
+        CHECK(wrap.current()->id == pass.front());
+        CHECK(wrap.previous() && wrap.current()->id == pass.back());
+        // The seed is authoritative: asking for shuffle again with the same seed must reproduce the
+        // same walk even when the mode was already shuffle (an early return here would silently keep
+        // the previous permutation).
+        PlaybackSession reshuffle;
+        reshuffle.assign({good, other, Track{.id = 3}, Track{.id = 4}}, 0);
+        reshuffle.setMode(QueueMode::Shuffle, 21);
+        reshuffle.setMode(QueueMode::Shuffle, 22);
+        reshuffle.setMode(QueueMode::Shuffle, 21);
+        std::vector<int64_t> seededWalk;
+        for (int i = 0; i < 4; ++i) {
+            reshuffle.move(1);
+            seededWalk.push_back(reshuffle.currentTrack()->id);
+        }
+        PlaybackSession replays;
+        replays.assign({good, other, Track{.id = 3}, Track{.id = 4}}, 0);
+        replays.setMode(QueueMode::Shuffle, 21);
+        std::vector<int64_t> replayWalk;
+        for (int i = 0; i < 4; ++i) {
+            replays.move(1);
+            replayWalk.push_back(replays.currentTrack()->id);
+        }
+        CHECK(seededWalk == replayWalk && seededWalk.size() == 4);
+
+        // Jump, remove and reorder all keep the listener on the row they are hearing.
+        Queue edit;
+        edit.assign({good, other, Track{.id = 3}}, 1);
+        CHECK(edit.current()->id == 2);
+        CHECK(edit.removeAt(0) && edit.current()->id == 2 && edit.tracks.size() == 2);
+        CHECK(!edit.removeAt(9));
+        CHECK(edit.moveTrack(1, 0) && edit.current()->id == 2); // follows the row, not the slot
+        CHECK(!edit.moveTrack(0, 0) && !edit.moveTrack(0, 5));
+        CHECK(edit.setIndex(0) && edit.current()->id == 3);
+        CHECK(!edit.setIndex(0) && !edit.setIndex(9));
+        CHECK(edit.append({Track{.id = 0}, Track{.id = 4}}) && edit.tracks.size() == 3);
+        edit.assign({good, other}, 0);
+        CHECK(edit.insertNext({Track{.id = 9}}) && edit.tracks.size() == 3);
+        CHECK(edit.current()->id == 1 && edit.next() && edit.current()->id == 9);
+        edit.clear();
+        CHECK(edit.tracks.empty() && !edit.next() && !edit.previous() && !edit.current());
+        // The session exposes the same edits and reports the mode in its snapshot.
+        PlaybackSession modes;
+        modes.assign({good, other, Track{.id = 3}}, 2);
+        modes.setMode(QueueMode::Shuffle, 5);
+        CHECK(modes.mode() == QueueMode::Shuffle && modes.snapshot().mode == QueueMode::Shuffle);
+        CHECK(!modes.snapshot().repeat);
+        CHECK(modes.playIndex(0) && modes.queueIndex() == 0);
+        CHECK(modes.removeIndex(2) && modes.queueSize() == 2);
+        CHECK(modes.moveTrack(0, 1) && modes.queueIndex() == 1);
+        CHECK(modes.playNext({Track{.id = 8}}) && modes.queueSize() == 3);
+        CHECK(modes.enqueue({Track{.id = 7}}) && modes.queueSize() == 4);
+        modes.clearQueue();
+        CHECK(modes.queueEmpty() && modes.queueSize() == 0);
+    }
     // M1-A: one authoritative playback session instead of a private copy per entry point.
     {
         PlaybackSession headless;
@@ -217,17 +336,17 @@ int main() {
           std::string::npos);
     CHECK(!mcp.handle(Json{{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}}));
     auto listed = mcp.handle(Json{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/list"}});
-    CHECK((*listed)["result"]["tools"].size() == 12);
+    // The registry is the single source of truth, so adding a tool never needs a magic number here.
+    CHECK((*listed)["result"]["tools"].size() == musicToolDefinitions().size());
     {
         std::set<std::string> names;
         for (auto& tool : (*listed)["result"]["tools"])
             names.insert(tool["name"].get<std::string>());
-        CHECK(names == std::set<std::string>({"music_search", "music_open_collection", "music_play",
-                                              "music_control", "music_now_playing",
-                                              "music_get_lyrics", "music_recommend",
-                                              "music_play_random", "music_list_playlists",
-                                              "music_set_like", "music_add_to_playlist",
-                                              "music_get_status"}));
+        std::set<std::string> expected;
+        for (auto& tool : musicToolDefinitions())
+            expected.insert(tool["name"].get<std::string>());
+        CHECK(names == expected);
+        CHECK(names.contains("music_queue_list") && names.contains("music_queue_edit"));
     }
     auto called = mcp.handle(
         Json{{"jsonrpc", "2.0"},
@@ -281,7 +400,7 @@ int main() {
         CHECK(AgentConfig{}.baseUrl ==
               "https://opencode.ai/inference/go/openai/v1/chat/completions");
         auto tools = agentToolsFrom(musicToolDefinitions());
-        CHECK(tools.size() == 12);
+        CHECK(tools.size() == musicToolDefinitions().size());
         CHECK(tools[0]["type"] == "function" && tools[0]["function"]["name"].is_string());
         CHECK(tools[0]["function"]["parameters"]["type"] == "object");
         Json response = {{"choices", Json::array({Json{{"message", Json{{"content", "你好"}}}}})}};
@@ -336,8 +455,8 @@ int main() {
             },
             [&modelCalls](const AgentConfig&, const Json& messages, const Json& tools) {
                 ++modelCalls;
-                // 12 music tools plus the terminal-only persona creator.
-                CHECK(tools.size() == 13);
+                // Every music tool plus the terminal-only persona creator.
+                CHECK(tools.size() == musicToolDefinitions().size() + 1);
                 CHECK(tools.back()["function"]["name"] == "mora_create_persona");
                 CHECK(tools.back()["function"]["parameters"]["required"] ==
                       Json::array({"id", "name", "voice", "taste"}));
@@ -583,12 +702,18 @@ int main() {
         Settings settings;
         settings.volume = .35;
         settings.quality = "hires";
-        settings.repeat = true;
+        settings.queueMode = QueueMode::RepeatAll; // authoritative; `repeat` is only the legacy mirror
         settings.motion = false;
         settings.userName = L"阿木的听众";
         settings.personaId = "fox";
         settings.outputDeviceId = 3;
         settings.guideDone = true;
+        settings.reactEnabled = true;
+        settings.reactMinSeconds = 120;
+        settings.reactMaxChars = 40;
+        settings.contextLimitTokens = 65536;
+        settings.autoCompress = false;
+        settings.reviewChars = 1200;
         settings.history = {L"/search 晴天", L"/volume 35"};
         CHECK(settings.save(directory));
         auto loaded = Settings::load(directory);
@@ -596,8 +721,10 @@ int main() {
         CHECK(loaded.personaId == "fox");
         CHECK(loaded.outputDeviceId == 3);
         CHECK(loaded.guideDone);
-        CHECK(std::abs(loaded.volume - .35) < 1e-9 && loaded.quality == "hires" && loaded.repeat &&
-              !loaded.motion);
+        CHECK(loaded.queueMode == QueueMode::RepeatAll && loaded.repeat);
+        CHECK(loaded.reactEnabled && loaded.reactMinSeconds == 120 && loaded.reactMaxChars == 40);
+        CHECK(loaded.contextLimitTokens == 65536 && !loaded.autoCompress && loaded.reviewChars == 1200);
+        CHECK(std::abs(loaded.volume - .35) < 1e-9 && loaded.quality == "hires" && !loaded.motion);
         CHECK(loaded.history.size() == 2 && loaded.history[0] == L"/search 晴天");
         {
             std::ofstream file(directory / L"settings.json", std::ios::binary | std::ios::trunc);
@@ -606,6 +733,19 @@ int main() {
         auto recovered = Settings::load(directory);
         CHECK(recovered.volume == 1.0 && recovered.quality == "lossless" && !recovered.repeat &&
               recovered.history.empty());
+        // Out-of-range reaction and context values fall back to safe defaults instead of sticking.
+        CHECK(!recovered.reactEnabled && recovered.reactMinSeconds == 45 &&
+              recovered.reactMaxChars == 25);
+        CHECK(recovered.contextLimitTokens == 0 && recovered.autoCompress &&
+              recovered.queueMode == QueueMode::Sequential);
+        {
+            std::ofstream file(directory / L"settings.json", std::ios::binary | std::ios::trunc);
+            file << R"({"repeat":true,"reactMinSeconds":9000,"reactMaxChars":1})";
+        }
+        auto legacy = Settings::load(directory);
+        // The pre-mode `repeat` flag still decides the mode, and absurd values are clamped.
+        CHECK(legacy.queueMode == QueueMode::RepeatAll && legacy.repeat);
+        CHECK(legacy.reactMinSeconds == 600 && legacy.reactMaxChars == 10);
         // A persona id the player cannot resolve still falls back to the first built-in.
         CHECK(recovered.personaId == "amu" && recovered.outputDeviceId == -1);
         CHECK(!recovered.guideDone);
@@ -615,6 +755,113 @@ int main() {
         }
         CHECK(Settings::load(directory).guideDone);
         CHECK(resolvePersona(recovered.personaId).id == "amu");
+        std::filesystem::remove_all(directory);
+    }
+    // Conversation memory: it survives a restart, stays bounded, and compacts instead of forgetting.
+    {
+        auto directory = std::filesystem::temp_directory_path() /
+                         (L"mora-context-" + std::to_wstring(GetCurrentProcessId()));
+        std::filesystem::remove_all(directory);
+        CHECK(loadConversation(directory).empty());
+        Conversation conversation;
+        conversation.append("user", "播放夜的钢琴曲");
+        conversation.append("assistant", "正在为你播放《夜的钢琴曲》");
+        conversation.append("user", "再推荐几首类似的");
+        CHECK(conversation.turns.size() == 3 && conversation.turns[0].role == "user");
+        CHECK(saveConversation(directory, conversation));
+        auto restored = loadConversation(directory);
+        CHECK(restored.turns.size() == 3 && restored.turns[2].content == "再推荐几首类似的");
+        // The projection carries the checkpoint as its own system message, then the newest turns.
+        // The projection keeps the newest `limit` messages in order, oldest first.
+        auto history = conversationHistory(restored, 2);
+        CHECK(history.size() == 2 && history[0].role == "assistant" &&
+              history[1].content == "再推荐几首类似的");
+        restored.summary = "用户喜欢安静的钢琴曲";
+        history = conversationHistory(restored, 2);
+        CHECK(history.size() == 3 && history[0].role == "system" &&
+              history[0].content.find("安静的钢琴曲") != std::string::npos);
+        // Compacting folds the older turns into the checkpoint and keeps the newest ones verbatim.
+        compactConversation(restored, "用户要求更多类似推荐", 2);
+        CHECK(restored.turns.size() == 2 && restored.compressedTurns == 1);
+        CHECK(restored.summary.find("安静的钢琴曲") != std::string::npos &&
+              restored.summary.find("类似推荐") != std::string::npos);
+        // A second compaction merges instead of replacing the earlier checkpoint.
+        compactConversation(restored, "用户最终接受了推荐", 1);
+        CHECK(restored.compressedTurns == 2);
+        CHECK(restored.summary.find("安静的钢琴曲") != std::string::npos &&
+              restored.summary.find("接受了推荐") != std::string::npos);
+        // Empty content never becomes a turn, and the ring buffer keeps the newest entries.
+        Conversation bounded;
+        for (int i = 0; i < 60; ++i)
+            bounded.append("user", "第" + std::to_string(i) + "条");
+        CHECK(bounded.turns.size() == 40 && bounded.turns.back().content == "第59条");
+        bounded.append("assistant", "");
+        CHECK(bounded.turns.size() == 40);
+        // A corrupt or oversized file must not break the player or surface as memory.
+        {
+            std::ofstream file(directory / L"chat-memory.json", std::ios::binary | std::ios::trunc);
+            file << R"({"summary":42,"turns":"not-an-array","compressedTurns":"x"})";
+        }
+        auto corrupt = loadConversation(directory);
+        CHECK(corrupt.empty() && corrupt.compressedTurns == 0);
+        {
+            std::ofstream file(directory / L"chat-memory.json", std::ios::binary | std::ios::trunc);
+            file << R"({"turns":[{"role":"tool","content":"nope"},{"role":"user","content":"有效"}]})";
+        }
+        auto filtered = loadConversation(directory);
+        CHECK(filtered.turns.size() == 1 && filtered.turns[0].content == "有效");
+        std::filesystem::remove_all(directory);
+    }
+    // Listen history: local day/month/year reports, bounded projection, no account material.
+    {
+        auto directory = std::filesystem::temp_directory_path() /
+                         (L"mora-stats-" + std::to_wstring(GetCurrentProcessId()));
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        ListenPeriod period{};
+        CHECK(parseListenPeriod("day", period) && period == ListenPeriod::Day);
+        CHECK(parseListenPeriod("month", period) && period == ListenPeriod::Month);
+        CHECK(parseListenPeriod("year", period) && period == ListenPeriod::Year);
+        CHECK(!parseListenPeriod("decade", period));
+        CHECK(std::string(listenPeriodName(ListenPeriod::Year)) == "year");
+        {
+            ListenHistory history(directory);
+            Track listened{.id = 11, .name = L"晴天", .artist = L"周杰伦", .album = L"叶惠美"};
+            listened.duration = 269;
+            history.onTrackStart(listened, "search");
+            history.onTrackEnd(listened, 268.0, true);
+            Track skipped{.id = 22, .name = L"夜曲", .artist = L"周杰伦"};
+            skipped.duration = 227;
+            history.onTrackStart(skipped, "playlist");
+            history.onTrackEnd(skipped, 10.0, false);
+            // finalize-once: repeated flushes must not duplicate the finished listens.
+            history.flush();
+            history.flush();
+            auto day = history.aggregate(ListenPeriod::Day);
+            CHECK(day.period == ListenPeriod::Day && !day.key.empty());
+            CHECK(day.plays == 2 && day.completedPlays == 1 && day.skippedPlays == 1);
+            CHECK(day.uniqueSongs == 2 && day.uniqueArtists == 1);
+            CHECK(day.listenedSeconds >= 270 && day.byHour.size() == 24);
+            CHECK(day.firstStart > 0 && day.lastStart >= day.firstStart);
+            CHECK(day.topSongs.size() == 2 && day.topSongs[0].label == "晴天" &&
+                  day.topSongs[0].artist == "周杰伦" && day.topSongs[0].plays == 1);
+            CHECK(day.topArtists.size() == 1 && day.topArtists[0].plays == 2);
+            CHECK(!day.availableKeys.empty() && day.availableKeys.front() == day.key);
+            // Day, month and year all see the same two listens; only the bucket key differs.
+            CHECK(history.aggregate(ListenPeriod::Month).plays == 2);
+            CHECK(history.aggregate(ListenPeriod::Year).plays == 2);
+            CHECK(history.aggregate(ListenPeriod::Day, "1999-01-01").plays == 0);
+            auto projection = listenStatsJson(day);
+            auto text = projection.dump();
+            CHECK(projection["period"] == "day" && projection["plays"] == 2);
+            CHECK(projection["timezone"] == "local" && projection["topSongs"].is_array());
+            CHECK(projection["hourHistogram"].size() == 24);
+            CHECK(text.size() <= 8192);
+            // The projection is model input, so it must never carry account or stream material.
+            for (const char* forbidden : {"cookie", "MUSIC_U", "http://", "https://", "uid", "session"})
+                CHECK(text.find(forbidden) == std::string::npos);
+            CHECK(!history.entries().empty());
+        }
         std::filesystem::remove_all(directory);
     }
     // Lyrics: LRC parsing, the live index and the bounded projection the agent reads.

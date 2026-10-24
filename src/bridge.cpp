@@ -117,7 +117,28 @@ namespace mora {
             for (auto& c : sid)
                 if (c == L'\\' || c == L'/')
                     c = L'-';
-            return std::wstring(L"\\\\.\\pipe\\mora-player-") + (sid.empty() ? L"default" : sid);
+            std::wstring base = std::wstring(L"\\\\.\\pipe\\mora-player-") +
+                                (sid.empty() ? L"default" : sid);
+            // An explicit --data-dir gets its own pipe scope. Test profiles and parallel
+            // installations stop fighting over one pipe (and stop touching the player the user is
+            // actually listening to); the default profile keeps the historical name so existing
+            // MCP adapters and a running player stay attached.
+            wchar_t buffer[32768];
+            DWORD length = GetEnvironmentVariableW(L"MORA_DATA_DIR", buffer, 32768);
+            if (length == 0 || length >= 32768)
+                return base;
+            auto path = std::filesystem::absolute(std::wstring(buffer, length)).wstring();
+            // FNV-1a over the widened path: deterministic, dependency-free and short.
+            uint64_t hash = 1469598103934665603ull;
+            for (wchar_t c : path) {
+                hash ^= static_cast<uint64_t>(c);
+                hash *= 1099511628211ull;
+            }
+            const wchar_t* digits = L"0123456789abcdef";
+            std::wstring suffix;
+            for (int shift = 28; shift >= 0; shift -= 4)
+                suffix += digits[(hash >> shift) & 0xf];
+            return base + L"-" + suffix;
         }();
         return name;
     }

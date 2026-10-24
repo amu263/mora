@@ -30,6 +30,29 @@ namespace mora {
         }
         if (data.contains("repeat") && data["repeat"].is_boolean())
             settings.repeat = data["repeat"];
+        // `repeat` predates explicit queue modes; it still decides the mode when no newer value
+        // was stored, and every mode round-trips through the single `queueMode` field.
+        settings.queueMode = settings.repeat ? QueueMode::RepeatAll : QueueMode::Sequential;
+        if (data.contains("queueMode") && data["queueMode"].is_string()) {
+            QueueMode parsed;
+            if (parseQueueMode(data["queueMode"].get<std::string>(), parsed))
+                settings.queueMode = parsed;
+        }
+        settings.repeat = settings.queueMode == QueueMode::RepeatAll ||
+                          settings.queueMode == QueueMode::RepeatOne;
+        if (data.contains("reactEnabled") && data["reactEnabled"].is_boolean())
+            settings.reactEnabled = data["reactEnabled"];
+        if (data.contains("reactMinSeconds") && data["reactMinSeconds"].is_number_integer())
+            settings.reactMinSeconds = std::clamp(data["reactMinSeconds"].get<int>(), 10, 600);
+        if (data.contains("reactMaxChars") && data["reactMaxChars"].is_number_integer())
+            settings.reactMaxChars = std::clamp(data["reactMaxChars"].get<int>(), 10, 200);
+        if (data.contains("contextLimitTokens") && data["contextLimitTokens"].is_number_integer())
+            settings.contextLimitTokens =
+                std::clamp(data["contextLimitTokens"].get<int>(), 0, 4000000);
+        if (data.contains("autoCompress") && data["autoCompress"].is_boolean())
+            settings.autoCompress = data["autoCompress"];
+        if (data.contains("reviewChars") && data["reviewChars"].is_number_integer())
+            settings.reviewChars = std::clamp(data["reviewChars"].get<int>(), 200, 4000);
         if (data.contains("motion") && data["motion"].is_boolean())
             settings.motion = data["motion"];
         if (data.contains("userName") && data["userName"].is_string()) {
@@ -65,6 +88,13 @@ namespace mora {
                   {"volume", std::clamp(volume, 0.0, 1.0)},
                   {"quality", quality},
                   {"repeat", repeat},
+                  {"queueMode", queueModeName(queueMode)},
+                  {"reactEnabled", reactEnabled},
+                  {"reactMinSeconds", std::clamp(reactMinSeconds, 10, 600)},
+                  {"reactMaxChars", std::clamp(reactMaxChars, 10, 200)},
+                  {"contextLimitTokens", std::clamp(contextLimitTokens, 0, 4000000)},
+                  {"autoCompress", autoCompress},
+                  {"reviewChars", std::clamp(reviewChars, 200, 4000)},
                   {"motion", motion},
                   {"userName", userName.empty() || userName.size() > 24 ? "" : utf8(userName)},
                   {"guideDone", guideDone},

@@ -76,6 +76,47 @@ namespace mora {
                                                  : "network_unavailable",
                             e.what());
         }
+        // Bridge replies are data, not code: read them without throwing on a surprising type so a
+        // malformed player answer becomes a plain default instead of a protocol-level failure.
+        int jsonInt(const Json& object, const char* name, int fallback) {
+            if (!object.is_object() || !object.contains(name))
+                return fallback;
+            const auto& value = object[name];
+            if (value.is_number_integer()) {
+                if (value.is_number_unsigned()) {
+                    auto number = value.get<uint64_t>();
+                    return number > 2147483647ULL ? 2147483647 : static_cast<int>(number);
+                }
+                auto number = value.get<int64_t>();
+                return number < -2147483648LL ? -2147483648
+                       : number > 2147483647LL ? 2147483647
+                                               : static_cast<int>(number);
+            }
+            if (value.is_number_float())
+                return static_cast<int>(value.get<double>());
+            return fallback;
+        }
+        int64_t jsonInt64(const Json& object, const char* name, int64_t fallback) {
+            if (!object.is_object() || !object.contains(name))
+                return fallback;
+            const auto& value = object[name];
+            if (!value.is_number_integer())
+                return fallback;
+            return value.is_number_unsigned() ? static_cast<int64_t>(value.get<uint64_t>())
+                                              : value.get<int64_t>();
+        }
+        std::string jsonText(const Json& object, const char* name, std::string fallback = {}) {
+            if (!object.is_object() || !object.contains(name))
+                return fallback;
+            const auto& value = object[name];
+            return value.is_string() ? value.get<std::string>() : std::move(fallback);
+        }
+        bool jsonBool(const Json& object, const char* name, bool fallback) {
+            if (!object.is_object() || !object.contains(name))
+                return fallback;
+            const auto& value = object[name];
+            return value.is_boolean() ? value.get<bool>() : fallback;
+        }
         std::string kindName(const Json& args, bool allowSong) {
             std::string kind = "song";
             if (args.contains("kind")) {
@@ -100,7 +141,10 @@ namespace mora {
             {"title", "搜索网易云音乐"},
             {"description",
              "Search real NetEase song, album or playlist metadata. Returns IDs and names, never "
-             "stream URLs or account cookies. Search does not start playback; use music_play."},
+             "stream URLs or account cookies. Search does not start playback; use music_play. For an "
+             "artist, style, scene or mood that has no single album, search with limit 10..30 and "
+             "then build the whole queue in one call with music_queue_edit(op=replace, ids=[...]) "
+             "using 5..20 ids - queueing only one song for a whole series is a defect."},
             {"inputSchema",
              Json{
                  {"type", "object"},
@@ -156,10 +200,12 @@ namespace mora {
             {"name", "music_play"},
             {"title", "在正在运行的播放器上播放"},
             {"description",
-             "Submit playback into the one running MORA player: a song replaces the queue with that "
-             "track, an album or playlist replaces it with the collection from startIndex. Returns "
-             "accepted state; query music_now_playing for real playback state. Fails with "
-             "needs_player when no terminal player is attached."},
+             "Submit playback into the one running MORA player: kind=song replaces the queue with "
+             "that single track, while kind=album or kind=playlist replaces the queue with the whole "
+             "collection and starts at startIndex - use those whenever the user asks for an entire "
+             "album or playlist. Returns accepted state; query music_now_playing for the real "
+             "playback state instead of assuming audio started. Fails with needs_player when no "
+             "terminal player is attached."},
             {"inputSchema",
              Json{{"type", "object"},
                   {"properties",
@@ -273,7 +319,8 @@ namespace mora {
              "Pick one candidate from a previous music_recommend set (candidateSetId) or from a fresh "
              "intent search - never the track that is already playing - and submit it to the running "
              "player. Stops and reports instead of skipping through unavailable tracks; returns "
-             "status playing only after the player really started audio."},
+             "status playing only after the player really started audio. Use this when the request "
+             "is vague ('play something random') instead of asking the user again."},
             {"inputSchema",
              Json{{"type", "object"},
                   {"properties",
@@ -342,6 +389,95 @@ namespace mora {
                   {"additionalProperties", false}}},
             {"annotations", Json{{"readOnlyHint", false},
                                  {"destructiveHint", false},
+                                 {"idempotentHint", false},
+                                 {"openWorldHint", true}}}});
+        tools.push_back(Json{
+            {"name", "music_queue_list"},
+            {"title", "查看播放队列"},
+            {"description",
+             "Read the running player's play queue: the total number of rows, the 0-based index of "
+             "the row playing now, the play mode (sequential, repeat_all, repeat_one or shuffle) "
+             "and a bounded window of rows with id, name, artist, album and duration. limit is at "
+             "most 100 and offset is a 0-based row offset inside that bounded window. Read-only: it "
+             "never changes playback, never writes the account and never returns stream URLs, "
+             "cookies or keys. Fails with needs_player when no terminal player is attached."},
+            {"inputSchema",
+             Json{{"type", "object"},
+                  {"properties",
+                   Json{{"limit", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 100},
+                                       {"default", 100}}},
+                        {"offset", Json{{"type", "integer"},
+                                        {"minimum", 0},
+                                        {"maximum", 10000},
+                                        {"default", 0},
+                                        {"description",
+                                         "0-based row offset inside the bounded window."}}}}},
+                  {"additionalProperties", false}}},
+            {"annotations", Json{{"readOnlyHint", true},
+                                 {"destructiveHint", false},
+                                 {"idempotentHint", true},
+                                 {"openWorldHint", false}}}});
+        tools.push_back(Json{
+            {"name", "music_queue_edit"},
+            {"title", "编辑播放队列与播放模式"},
+            {"description",
+             "Change the running player's queue, one operation per call: never a second player and "
+             "never an automatic retry. op is one of: set_mode (mode: sequential = play through and "
+             "stop, repeat_all = loop the whole list, repeat_one = loop the single track, shuffle = "
+             "random order; optional seed makes shuffle reproducible), play_index (jump straight to "
+             "a queue row), remove (delete one row), move (move a row to another position), clear "
+             "(empty the whole queue and stop), replace (swap the whole queue for a new set of songs "
+             "and start at the first one - 'change it to this set'), add_next (insert songs right "
+             "after the current track, the usual 'play next'), append (add songs to the end and keep "
+             "everything already queued). Row indexes are 0-based, exactly like "
+             "music_play.startIndex. Out-of-range indexes, unknown ops and unknown fields return "
+             "invalid_arguments and change nothing. Returns the new queue state. Choose like a "
+             "normal player: for a whole album or playlist use music_play(kind=album or playlist) or "
+             "music_open_collection, which replaces the queue with that collection and plays it; for "
+             "an artist, style, scene or mood that has no single album, search first (music_search "
+             "with limit 10..30), then build the queue in one call with op=replace and 5..20 ids so "
+             "several songs really play - queueing only one song is a defect; when the user says "
+             "'add some more', 'queue it next' or 'keep playing more', use append or add_next and "
+             "never replace the list that is already playing; when the request is vague ('play "
+             "something random'), use music_recommend plus music_play_random instead of asking "
+             "again."},
+            {"inputSchema",
+             Json{{"type", "object"},
+                  {"properties",
+                   Json{{"op", Json{{"type", "string"},
+                                    {"enum", Json::array({"set_mode", "play_index", "remove", "move",
+                                                          "clear", "add_next", "append",
+                                                          "replace"})}}},
+                        {"mode", Json{{"type", "string"},
+                                      {"enum", Json::array({"sequential", "repeat_all", "repeat_one",
+                                                            "shuffle"})},
+                                      {"description", "Required for op=set_mode."}}},
+                        {"seed", Json{{"type", "integer"},
+                                      {"minimum", 1},
+                                      {"description",
+                                       "Optional deterministic shuffle seed for op=set_mode."}}},
+                        {"index", Json{{"type", "integer"},
+                                       {"minimum", 0},
+                                       {"maximum", 9999},
+                                       {"description",
+                                        "0-based queue row for play_index or remove."}}},
+                        {"from", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", 9999}}},
+                        {"to", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", 9999}}},
+                        {"id", Json{{"type", "integer"},
+                                    {"minimum", 1},
+                                    {"description",
+                                     "One song id for replace, add_next or append (id or ids, not "
+                                     "both)."}}},
+                        {"ids", Json{{"type", "array"},
+                                     {"maxItems", 100},
+                                     {"items", Json{{"type", "integer"}, {"minimum", 1}}},
+                                     {"description",
+                                      "Song ids: up to 100 for replace (a whole series), up to 50 "
+                                      "for add_next or append."}}}}},
+                  {"required", Json::array({"op"})},
+                  {"additionalProperties", false}}},
+            {"annotations", Json{{"readOnlyHint", false},
+                                 {"destructiveHint", true},
                                  {"idempotentHint", false},
                                  {"openWorldHint", true}}}});
         tools.push_back(
@@ -504,6 +640,62 @@ namespace mora {
         }
         return items;
     }
+    Json MusicService::queueState(const Json& data) const {
+        // Project the player's queue into the documented shape. Only the fields below ever leave
+        // this process: no stream URL, cover URL, cookie or account identifier can leak through.
+        Json out = Json::object();
+        int total = jsonInt(data, "total", 0);
+        int index = jsonInt(data, "index", 0);
+        QueueMode mode = QueueMode::Sequential;
+        if (!parseQueueMode(jsonText(data, "mode", "sequential"), mode))
+            mode = QueueMode::Sequential;
+        out["total"] = total < 0 ? 0 : total;
+        out["index"] = index < 0 ? 0 : index;
+        out["mode"] = queueModeName(mode);
+        out["repeat"] = jsonBool(data, "repeat", mode == QueueMode::RepeatAll ||
+                                                    mode == QueueMode::RepeatOne);
+        Json items = Json::array();
+        if (data.is_object() && data.contains("items") && data["items"].is_array()) {
+            for (auto& item : data["items"]) {
+                if (!item.is_object() || items.size() >= 100)
+                    continue;
+                int position = jsonInt(item, "position", static_cast<int>(items.size()));
+                Json row = {{"position", position < 0 ? static_cast<int>(items.size()) : position},
+                            {"id", jsonInt64(item, "id", 0)},
+                            {"name", jsonText(item, "name")},
+                            {"artist", jsonText(item, "artist")},
+                            {"album", jsonText(item, "album")},
+                            {"durationSeconds", jsonInt(item, "durationSeconds", 0)}};
+                row["current"] = jsonBool(item, "current", row["position"] == out["index"]);
+                items.push_back(std::move(row));
+            }
+        }
+        out["items"] = std::move(items);
+        return out;
+    }
+    std::vector<Track> MusicService::queueTracks(const std::vector<int64_t>& ids) {
+        std::vector<Track> loaded;
+        try {
+            loaded = details(ids);
+        } catch (const ApiError&) {
+            // Metadata is a nicety, never a fake: without it the row still carries a real id and
+            // the player fills the rest in through its existing refresh path.
+        }
+        std::vector<Track> tracks;
+        tracks.reserve(ids.size());
+        for (auto& track : loaded)
+            if (track.id)
+                tracks.push_back(std::move(track));
+        for (auto id : ids) {
+            bool known = false;
+            for (auto& track : tracks)
+                if (track.id == id)
+                    known = true;
+            if (!known)
+                tracks.push_back(Track{.id = id});
+        }
+        return tracks;
+    }
     Json MusicService::lyricsTool(int64_t songId, bool includeTranslation, int maxLines) {
         // The attached player owns the account session and knows the live position, so it answers
         // when it can; a bare adapter still reads lyrics from its own read-only network path.
@@ -553,6 +745,8 @@ namespace mora {
                                                      "collection_paging",
                                                      "shared_session_playback",
                                                      "playback_control",
+                                                     "queue_control",
+                                                     "playback_modes",
                                                      "deterministic_recommendation",
                                                      "random_playback",
                                                      "playlist_listing",
@@ -861,6 +1055,135 @@ namespace mora {
                         {"playlistId", playlistId},
                         {"operationId", operationId},
                         {"status", "added"}};
+        }
+        if (name == "music_queue_list") {
+            onlyArguments(args, {"limit", "offset"});
+            int limit = boundedInteger(args, "limit", 100, 1, 100);
+            int offset = boundedInteger(args, "offset", 0, 0, 10000);
+            // Read the bounded head of the one authoritative queue, then page inside it: the
+            // projection stays correct even if the player answers the whole window at once.
+            auto reply = session("queue_list", Json{{"limit", 100}, {"offset", 0}});
+            Json state = queueState(reply.data);
+            Json window = Json::array();
+            const Json& rows = state["items"];
+            for (int row = offset; row < static_cast<int>(rows.size()) &&
+                                  static_cast<int>(window.size()) < limit;
+                 ++row)
+                window.push_back(rows[row]);
+            state["items"] = std::move(window);
+            state["offset"] = offset;
+            state["limit"] = limit;
+            return state;
+        }
+        if (name == "music_queue_edit") {
+            onlyArguments(args, {"op", "mode", "seed", "index", "from", "to", "id", "ids"});
+            if (!args.contains("op") || !args["op"].is_string())
+                throw ToolError("invalid_arguments", "op must be a string");
+            auto op = args["op"].get<std::string>();
+            Json params = {{"op", op}};
+            if (op == "set_mode") {
+                onlyArguments(args, {"op", "mode", "seed"});
+                if (!args.contains("mode") || !args["mode"].is_string())
+                    throw ToolError("invalid_arguments", "set_mode needs a mode string");
+                QueueMode mode = QueueMode::Sequential;
+                if (!parseQueueMode(args["mode"].get<std::string>(), mode))
+                    throw ToolError("invalid_arguments",
+                                    "mode must be sequential, repeat_all, repeat_one or shuffle");
+                params["mode"] = queueModeName(mode);
+                if (args.contains("seed"))
+                    params["seed"] = boundedInteger(args, "seed", 1, 1, 2147483647);
+            } else if (op == "play_index" || op == "remove") {
+                onlyArguments(args, {"op", "index"});
+                if (!args.contains("index"))
+                    throw ToolError("invalid_arguments", op + " needs an index");
+                params["index"] = boundedInteger(args, "index", 0, 0, 9999);
+            } else if (op == "move") {
+                onlyArguments(args, {"op", "from", "to"});
+                if (!args.contains("from") || !args.contains("to"))
+                    throw ToolError("invalid_arguments", "move needs from and to");
+                params["from"] = boundedInteger(args, "from", 0, 0, 9999);
+                params["to"] = boundedInteger(args, "to", 0, 0, 9999);
+            } else if (op == "clear") {
+                onlyArguments(args, {"op"});
+            } else if (op == "add_next" || op == "append" || op == "replace") {
+                onlyArguments(args, {"op", "id", "ids"});
+                if (args.contains("id") && args.contains("ids"))
+                    throw ToolError("invalid_arguments", "pass id or ids, not both");
+                // replace builds a fresh series (at most 100); append/add_next extend a queue that
+                // is already playing (at most 50, so one call can never become a request storm).
+                int maxIds = op == "replace" ? 100 : 50;
+                std::vector<int64_t> ids;
+                if (args.contains("id"))
+                    ids.push_back(positiveInteger(args, "id"));
+                if (args.contains("ids")) {
+                    if (!args["ids"].is_array())
+                        throw ToolError("invalid_arguments",
+                                        "ids must be an array of positive song ids");
+                    if (args["ids"].size() > static_cast<size_t>(maxIds))
+                        throw ToolError("invalid_arguments",
+                                        "ids may hold at most " + std::to_string(maxIds) +
+                                            " songs for " + op);
+                    for (auto& value : args["ids"]) {
+                        if (!value.is_number_integer())
+                            throw ToolError("invalid_arguments", "ids must be positive integers");
+                        int64_t id = value.is_number_unsigned()
+                                         ? static_cast<int64_t>(value.get<uint64_t>())
+                                         : value.get<int64_t>();
+                        if (id <= 0)
+                            throw ToolError("invalid_arguments", "ids must be positive integers");
+                        ids.push_back(id);
+                    }
+                }
+                if (ids.empty())
+                    throw ToolError("invalid_arguments", op + " needs id or ids");
+                // Writes belong to the one player session, so prove it is alive before spending a
+                // single network read on metadata. A missing player must never reach details().
+                auto current = link ? link("status", Json::object())
+                                    : BridgeReply(false, "needs_player",
+                                                  "no MORA player is attached; start mora first",
+                                                  Json::object());
+                if (!current.ok)
+                    throw ToolError(current.code.empty() || current.code == "disconnected"
+                                        ? std::string("needs_player")
+                                        : current.code,
+                                    current.message.empty() ? "no MORA player is attached"
+                                                            : current.message);
+                auto tracks = queueTracks(ids);
+                Json encoded = Json::array();
+                bool metadataResolved = false;
+                for (auto& track : tracks) {
+                    if (!track.name.empty())
+                        metadataResolved = true;
+                    encoded.push_back(Json{{"id", track.id},
+                                           {"name", utf8(track.name)},
+                                           {"artist", utf8(track.artist)},
+                                           {"album", utf8(track.album)},
+                                           {"duration", track.duration}});
+                }
+                params["ids"] = ids;
+                params["tracks"] = std::move(encoded);
+                params["metadataResolved"] = metadataResolved;
+            } else {
+                throw ToolError("invalid_arguments",
+                                "op must be set_mode, play_index, remove, move, clear, add_next, "
+                                "append or replace");
+            }
+            auto reply = session("queue_edit", params);
+            Json state = queueState(reply.data);
+            if (!reply.data.is_object() || !reply.data.contains("items")) {
+                // A player that only echoes "accepted" still has to report the new state honestly.
+                auto listed = link ? link("queue_list", Json{{"limit", 100}, {"offset", 0}})
+                                   : BridgeReply(false, "needs_player", "", Json::object());
+                if (listed.ok)
+                    state = queueState(listed.data);
+            }
+            state["op"] = op;
+            state["changed"] = jsonBool(reply.data, "changed", true);
+            if (op == "add_next" || op == "append" || op == "replace") {
+                state["metadataResolved"] = jsonBool(params, "metadataResolved", false);
+                state["requestedIds"] = params["ids"];
+            }
+            return state;
         }
         if (name != "music_search")
             throw std::invalid_argument("Unknown music tool");

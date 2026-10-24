@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 
 // Persona avatars are generated assets under assets/personas; the build adds -Iassets so these
@@ -271,7 +272,71 @@ namespace mora {
         prompt += L"工具返回 needs_player 时告诉用户先运行 mora 终端；写操作只在用户明确给出目标时调用。";
         prompt += L"用户想创建自定义人设时调用 mora_create_persona，并先问清名字、语气和推歌取向。";
         prompt += L"不得声称已经发生的播放或账号操作之外的任何副作用。";
+        prompt += personaIntentGuidance(persona);
         return prompt;
+    }
+
+    std::wstring personaIntentGuidance(const Persona& persona) {
+        // The same bounded rules for every persona, fronted by one line in that persona's own
+        // voice so a vague request ("随便来点歌") still turns into an action instead of a question.
+        static const std::map<std::string, const wchar_t*> openers{
+            {"amu", L"我懂你的意思，能猜到就直接给你放上，不磨叽。"},
+            {"fox", L"别跟我绕，意思到了我直接上歌。"},
+            {"devil", L"台上时间宝贵，能听懂就直接开场。"},
+            {"mushroom", L"我会轻轻接住你的意思，直接帮你放上。"},
+            {"daidai", L"唔……我大概懂啦，直接放给你听。"},
+        };
+        auto found = openers.find(persona.id);
+        std::wstring guidance =
+            found != openers.end()
+                ? std::wstring(found->second)
+                : L"我会先理解你的意思，再直接动手，最多确认一次。";
+        guidance +=
+            L"【怎么动手】能推断就直接搜索或推荐并播放，不要反复确认，也不要只在嘴上介绍；"
+            L"单曲→music_search 后 music_play(kind=song)；"
+            L"专辑/歌单→music_play 或 music_open_collection(kind=album|playlist)，整张替换队列连续播放；"
+            L"歌手/风格/场景/心情→music_search(query, limit 10..30) 取一组 id 后 "
+            L"music_queue_edit(op=replace, ids=[…]) 一次建立多首队列并从第一首开始，不要只播一首；"
+            L"真的不确定→music_recommend + music_play_random。"
+            L"“换成 / 只听 / 播放这张专辑”=替换队列；“再加上 / 再来点 / 接着放 / 排在后面”"
+            L"=append 或 add_next，不得替换当前队列。"
+            L"系列请求取回 5..20 首（有界，最多 50）。工具返回 accepted 后必须用 music_now_playing "
+            L"确认真实状态，不得编造播放结果。";
+        return guidance;
+    }
+
+    std::wstring personaWaitLine(const Persona& persona, int index) {
+        // One short corpus per built-in, in the persona's own voice. It stays small on purpose: the
+        // contract only needs a few rotating lines, not a second personality description.
+        static const std::map<std::string, std::vector<std::wstring>> lines{
+            {"amu",
+             {L"正在翻唱片架，稍等一下…", L"在曲库里挑一挑，马上回来。",
+              L"正在想哪首更适合你，别急。"}},
+            {"fox", {L"别急，我这就去扒拉两首。", L"给我一会儿，好歌不怕等。", L"正在挑，保准有味道。"}},
+            {"devil",
+             {L"稍等，台上的我正在选曲。", L"让我想一下，这首歌单怎么排。", L"马上就好，别走开哦。"}},
+            {"mushroom",
+             {L"慢慢来，我先翻一翻歌单。", L"正在找温柔的旋律，请稍候。",
+              L"稍等一下，我想给你挑首舒服的。"}},
+            {"daidai",
+             {L"唔……我找找看，等一下下。", L"让我想想哦，马上就好。", L"在翻歌单啦，别催我呀。"}},
+        };
+        auto found = lines.find(persona.id);
+        if (found != lines.end() && !found->second.empty()) {
+            int size = static_cast<int>(found->second.size());
+            int pick = ((index % size) + size) % size;
+            return found->second[static_cast<size_t>(pick)];
+        }
+        // A custom persona reuses one of three neutral templates, chosen by its id hash, and is
+        // addressed by its own name so it never borrows a built-in's voice.
+        static const std::array<const wchar_t*, 3> fallback{
+            L"正在为「%s」整理歌单，稍等一下…", L"让我想想要放哪几首，马上回来。",
+            L"歌单还在挑，请稍候。"};
+        std::wstring text = fallback[stableHash(persona.id) % fallback.size()];
+        auto at = text.find(L"%s");
+        if (at != std::wstring::npos)
+            text.replace(at, 2, persona.name);
+        return text;
     }
 
     std::wstring personaSearchSeed(const Persona& persona) {

@@ -177,8 +177,10 @@ def main():
          all((r.get('sessionHeader') or '').startswith('mora-') for r in records),
          json.dumps(records[0], ensure_ascii=False) if records else 'no requests')
     step('tools-advertised',
-         bool(records) and len(records[0].get('toolNames', [])) == 13 and
-         records[0]['toolNames'][-1] == 'mora_create_persona',
+         bool(records) and len(records[0].get('toolNames', [])) >= 13 and
+         records[0]['toolNames'][-1] == 'mora_create_persona' and
+         'music_queue_list' in records[0]['toolNames'] and
+         'music_queue_edit' in records[0]['toolNames'],
          f"{len(records[0].get('toolNames', [])) if records else 0} tools")
     step('tool-result-fed-back', len(records) == 2 and 'tool' in records[1].get('roles', []),
          f"second request roles={records[1].get('roles') if len(records) > 1 else []}")

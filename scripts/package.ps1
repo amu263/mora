@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent)).TrimEnd('\')
 $dist = [IO.Path]::GetFullPath((Join-Path $projectRoot 'dist'))
-$release = [IO.Path]::GetFullPath((Join-Path $dist 'MORA-0.6.0-preview-win-x64'))
+$release = [IO.Path]::GetFullPath((Join-Path $dist 'MORA-0.7.0-preview-win-x64'))
 $utf8 = New-Object Text.UTF8Encoding($false)
 
 function Assert-Within([string]$Path, [string]$Root) {
@@ -121,7 +121,7 @@ foreach ($file in $binary | Sort-Object relative) {
     Copy-Item -LiteralPath $file.source -Destination $target -Force
     $manifestFiles += [ordered]@{ relativePath=$file.relative; sha256=(Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash }
 }
-$manifest = [ordered]@{ packageId='mora-framework-win-x64'; version='0.6.0-preview'; files=$manifestFiles }
+$manifest = [ordered]@{ packageId='mora-framework-win-x64'; version='0.7.0-preview'; files=$manifestFiles }
 [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 5), $utf8)
 $releaseEntries = New-Object 'Collections.Generic.List[object]'
 foreach ($file in $manifestFiles) { $releaseEntries.Add([pscustomobject]@{ source=(Join-Path $release $file.relativePath.Replace('/','\')); relative=$file.relativePath }) }
@@ -138,8 +138,8 @@ $sourceFiles = @('README.md','THIRD-PARTY-NOTICES.md','LICENSE','.clang-format',
 foreach ($name in $sourceFiles) { Add-File $source (Join-Path $projectRoot $name) $name }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.IO.Compression
-$binaryZip = Join-Path $dist 'MORA-0.6.0-preview-win-x64.zip'
-$sourceZip = Join-Path $dist 'MORA-0.6.0-preview-source.zip'
+$binaryZip = Join-Path $dist 'MORA-0.7.0-preview-win-x64.zip'
+$sourceZip = Join-Path $dist 'MORA-0.7.0-preview-source.zip'
 Write-Archive $binaryZip $releaseEntries
 Write-Archive $sourceZip $source
 Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExe | Format-List

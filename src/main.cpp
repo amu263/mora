@@ -1,5 +1,6 @@
 #include "agent.hpp"
 #include "bridge.hpp"
+#include "context.hpp"
 #include "mcp.hpp"
 #include "qrcodegen.hpp"
 #include "ui.hpp"
@@ -19,7 +20,7 @@ int main() {
     int64_t probePlay = 0;
     std::string probeQuality = "standard";
     bool mcp = false, loginQr = false, accountCheck = false, setAgentKey = false,
-         agentCheck = false;
+         agentCheck = false, listModels = false;
     std::wstring chatText;
     try {
         for (int i = 1; i < count; ++i) {
@@ -41,6 +42,8 @@ int main() {
                 setAgentKey = true;
             else if (a == L"--agent-check")
                 agentCheck = true;
+            else if (a == L"--models")
+                listModels = true;
             else if (a == L"--chat")
                 chatText = value();
             else if (a == L"--no-motion")
@@ -68,7 +71,7 @@ int main() {
                 auto k = value();
                 kind = k == L"album" ? Kind::Album : k == L"playlist" ? Kind::Playlist : Kind::Song;
             } else if (a == L"--version") {
-                std::cout << "MORA 0.6.0-preview / Windows x64 native\n";
+                std::cout << "MORA 0.7.0-preview / Windows x64 native\n";
                 LocalFree(args);
                 return 0;
             } else if (a == L"--help") {
@@ -81,9 +84,12 @@ int main() {
                        "memory\n  mora --mcp          MCP stdio framework\n  mora --login-qr    "
                        "Headless QR login (stores DPAPI session)\n  mora --account      Account "
                        "diagnostics (nickname/uid/likes/playlists)\n  mora --set-agent-key  Read a "
-                       "model key from stdin into the DPAPI vault\n  mora --agent-check   Show model "
-                       "endpoint/model/key presence (never the key)\n  mora --chat TEXT      One "
-                       "bounded model tool loop (attach a running player for playback)\n\n"
+                       "model key from stdin into the DPAPI vault\n  mora --models        List the "
+                       "models the configured endpoint advertises, with the context window and "
+                       "modalities it reports (never the key)\n  mora --agent-check   Show model "
+                       "endpoint/model/key presence and the cached context window (never the key)\n  mora --chat TEXT      One "
+                       "bounded model tool loop with chat-memory.json history (attach a running "
+                       "player for playback)\n\n"
                        "Commands: /search QUERY, /albums QUERY, /playlists QUERY, /login\n"
                        "          /queue, /play 1, /pause, /home, /help, /quit\n"
                        "Input: / command suggestions, Tab complete, Enter execute\n"
@@ -122,13 +128,75 @@ int main() {
                       << '\n';
             return 0;
         }
+        if (listModels) {
+            auto config = loadAgentConfig();
+            // Read-only discovery of the sibling /models route of the configured chat endpoint.
+            // Modalities and the context window are reported for information; a request never
+            // carries a modality and the key is never printed.
+            auto catalog = fetchModelCatalog(config);
+            if (catalog.ok)
+                cacheModelCatalog(catalog);
+            Json models = Json::array();
+            for (auto& model : catalog.models)
+                models.push_back(Json{{"id", model.id},
+                                      {"configured", model.id == config.model},
+                                      {"inputModalities", model.inputModalities},
+                                      {"outputModalities", model.outputModalities},
+                                      {"contextTokens", model.contextTokens},
+                                      {"maxOutputTokens", model.maxOutputTokens},
+                                      {"reasoning", model.reasoning}});
+            auto cached = cachedModelCatalog();
+            Json result = {{"baseUrl", config.baseUrl},
+                           {"model", config.model},
+                           {"keyPresent", agentKeyPresent()},
+                           {"endpoint", catalog.endpoint},
+                           {"ok", catalog.ok},
+                           {"reportOnly", true},
+                           {"models", models},
+                           {"cached", {{"ok", cached.ok},
+                                       {"endpoint", cached.endpoint},
+                                       {"modelCount", (int64_t)cached.models.size()}}}};
+            if (!catalog.ok) {
+                result["code"] = catalog.code;
+                result["error"] = catalog.error;
+            }
+            std::cout << result.dump(2) << '\n';
+            return catalog.ok ? 0 : 5;
+        }
         if (agentCheck) {
             auto config = loadAgentConfig();
+            auto cached = cachedModelCatalog();
+            Json cachedModel = Json(nullptr);
+            for (auto& model : cached.models) {
+                if (model.id != config.model)
+                    continue;
+                cachedModel = Json{{"id", model.id},
+                                   {"contextTokens", model.contextTokens},
+                                   {"maxOutputTokens", model.maxOutputTokens},
+                                   {"inputModalities", model.inputModalities},
+                                   {"outputModalities", model.outputModalities},
+                                   {"reasoning", model.reasoning}};
+                break;
+            }
             std::cout << Json{{"baseUrl", config.baseUrl},
                               {"model", config.model},
                               {"keyPresent", agentKeyPresent()},
                               {"maxToolCalls", config.maxToolCalls},
                               {"maxRounds", config.maxRounds},
+                              {"contextTokens", config.contextTokens},
+                              {"contextLimitTokens", config.contextTokens > 0
+                                                         ? config.contextTokens
+                                                         : config.contextFallbackTokens},
+                              {"contextFallbackTokens", config.contextFallbackTokens},
+                              {"compressAt", config.compressAt},
+                              {"autoCompress", config.autoCompress},
+                              {"keepRecentMessages", (int64_t)config.keepRecentMessages},
+                              {"modelModalities", config.modelModalities},
+                              {"cachedCatalog", {{"ok", cached.ok},
+                                                 {"code", cached.code},
+                                                 {"endpoint", cached.endpoint},
+                                                 {"modelCount", (int64_t)cached.models.size()}}},
+                              {"cachedModel", cachedModel},
                               {"dataDir", utf8(stateDirectory().wstring())}}
                              .dump(2)
                       << '\n';
@@ -145,20 +213,34 @@ int main() {
                 return bridge.call(method, params, 25000);
             });
             auto config = loadAgentConfig();
+            auto directory = stateDirectory();
+            // The remembered conversation (checkpoint plus newest turns) is handed to the loop,
+            // which compresses further when the estimated prompt crosses the window.
+            auto conversation = loadConversation(directory);
             auto outcome = runChatLoop(config, utf8(chatText),
                                        [&service](const std::string& tool, const Json& arguments) {
                                            return service.invoke(tool, arguments);
-                                       });
+                                       },
+                                       {}, {}, conversationHistory(conversation, 24));
             Json result = {{"model", config.model},
                            {"baseUrl", config.baseUrl},
                            {"playerAttached", bridge.connected()},
                            {"ok", outcome.ok},
                            {"toolCalls", outcome.toolCalls},
+                           {"promptTokens", (int64_t)outcome.promptTokens},
+                           {"contextLimitTokens", (int64_t)outcome.contextLimitTokens},
+                           {"compressedMessages", outcome.compressedMessages},
+                           {"compressionDegraded", outcome.compressionDegraded},
+                           {"compressionCode", outcome.compressionCode},
                            {"answer", utf8(outcome.text)},
                            {"trace", outcome.trace}};
             if (!outcome.ok) {
                 result["code"] = outcome.code;
                 result["error"] = outcome.error;
+            } else if (!outcome.text.empty()) {
+                conversation.append("user", utf8(chatText));
+                conversation.append("assistant", utf8(outcome.text));
+                result["memorySaved"] = saveConversation(directory, conversation);
             }
             std::cout << result.dump(2) << '\n';
             CoUninitialize();
