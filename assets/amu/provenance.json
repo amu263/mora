@@ -1,0 +1,47 @@
+{
+  "character": "阿木 / Amu",
+  "reference": {
+    "kind": "latest user conversation attachment",
+    "description": "Left-facing close-up portrait: water-blue short hair, white eyebrows, blue eyes, white/blue OVER-EAR headphones with Amu signature, white hoodie",
+    "emoteReferencesUsed": false
+  },
+  "generation": {
+    "mode": "built-in image_gen",
+    "source": "amu-source.png",
+    "prompt": "prompt.txt"
+  },
+  "perfectPixel": {
+    "repository": "https://github.com/theamusing/perfectPixel",
+    "commit": "72096de5cf1bff9102687c4f89af6f62c4273a86",
+    "backend": "numpy/noCV2",
+    "grid": [
+      48,
+      48
+    ],
+    "sample_method": "majority",
+    "refine_intensity": 0.18,
+    "fix_square": false
+  },
+  "postprocess": {
+    "paletteColors": 31,
+    "dither": false,
+    "alpha": "same refined grid; threshold160",
+    "refinedSize": [
+      48,
+      49
+    ],
+    "transparentBottomPadding": 1
+  },
+  "output": {
+    "width": 48,
+    "height": 50,
+    "embeddedPixelsBytes": 2400,
+    "paletteBytes": 93,
+    "staticPortrait": true
+  },
+  "sha256": {
+    "amu-source.png": "8bd4452bfe1a5343d1be58b5d3ef21d7c1128d507ec660378680f88aa07a29e7",
+    "amu-pixel.png": "95e64a4139042eb105df5f3253cae4bae77f2d5f09681c3b4585f5d36a67506a",
+    "amu_sprite.hpp": "e657102304f040db8727f13b1e8b69d45dc6a55af0b81b0d232031d620fed728"
+  }
+}

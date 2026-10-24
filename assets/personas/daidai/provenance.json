@@ -1,0 +1,51 @@
+{
+  "persona": "daidai",
+  "source": "daidai2.png",
+  "sourceSha256": "15e36c8f4e4680e0a2dda857f811b07c939c887817c084e490452a77017c2515",
+  "grid": [
+    48,
+    48
+  ],
+  "crop": {
+    "subjectBox": [
+      9,
+      0,
+      1011,
+      1023
+    ],
+    "cropTopFraction": 0.0,
+    "cropHeightFraction": 0.72,
+    "cropCenterXFraction": 0.5,
+    "squareSide": 737,
+    "cropTopPixels": 0,
+    "cropLeftPixels": 144
+  },
+  "background": {
+    "sampledRgb": [
+      209,
+      202,
+      254
+    ],
+    "tolerance": 48.0,
+    "alphaRule": "flood fill from the crop border only"
+  },
+  "postprocess": {
+    "paletteColors": 31,
+    "dither": false,
+    "saturation": 1.06,
+    "contrast": 1.1,
+    "gamma": 1.0,
+    "sharpenPercent": 40,
+    "autoLevels": true
+  },
+  "output": {
+    "width": 48,
+    "height": 50,
+    "embeddedPixelsBytes": 2400,
+    "paletteBytes": 93
+  },
+  "sha256": {
+    "daidai-pixel.png": "bad301848704f4bcc2ddd11d0e316bbb8f761c31e60434410bc0d5b0bb6310c5",
+    "daidai_sprite.hpp": "cb4151c18a57eda22558caa51d337a5e498a5086e8a80bb2a169638e3e45e891"
+  }
+}

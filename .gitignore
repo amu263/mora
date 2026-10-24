@@ -1,0 +1,21 @@
+/build/
+/tools/
+/dist/
+/.worktrees/
+*.obj
+*.o
+session.bin
+session.tmp
+__pycache__/
+# Local development records and original artwork are private.
+/AGENTS.md
+/HANDOFF.md
+/DEVELOPMENT_PLAN.md
+/docs/**
+!/docs/home-preview.png
+!/docs/TOOL_CONTRACTS.md
+!/docs/upstream-LICENSE
+/assets/**/*-source.png
+/assets/**/*-source.jpg
+/assets/**/*-source.jpeg
+/assets/**/*-source.webp

@@ -1,0 +1,51 @@
+{
+  "persona": "fox",
+  "source": "fox.png",
+  "sourceSha256": "ebb53c717865d12ed3f4250ec2bcde616447c15fb743ad9433fe8974e60c9c5e",
+  "grid": [
+    48,
+    48
+  ],
+  "crop": {
+    "subjectBox": [
+      40,
+      0,
+      985,
+      1023
+    ],
+    "cropTopFraction": 0.0,
+    "cropHeightFraction": 0.72,
+    "cropCenterXFraction": 0.5,
+    "squareSide": 737,
+    "cropTopPixels": 0,
+    "cropLeftPixels": 144
+  },
+  "background": {
+    "sampledRgb": [
+      251,
+      247,
+      227
+    ],
+    "tolerance": 48.0,
+    "alphaRule": "flood fill from the crop border only"
+  },
+  "postprocess": {
+    "paletteColors": 31,
+    "dither": false,
+    "saturation": 1.06,
+    "contrast": 1.1,
+    "gamma": 1.0,
+    "sharpenPercent": 40,
+    "autoLevels": true
+  },
+  "output": {
+    "width": 48,
+    "height": 50,
+    "embeddedPixelsBytes": 2400,
+    "paletteBytes": 93
+  },
+  "sha256": {
+    "fox-pixel.png": "9c82f5236ebe1697da967406ac326d8021a849a330e923bb114e95e6af5e9aaa",
+    "fox_sprite.hpp": "a4c9c3c8ddab84b109659611d2fd885c2e40c0b9636bc641def593fc4327b6bf"
+  }
+}

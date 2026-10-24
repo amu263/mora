@@ -1,0 +1,51 @@
+{
+  "persona": "devil",
+  "source": "devil3.png",
+  "sourceSha256": "6c5331a48c19ca166071f24d51adba78744f1e8e075de48e35f0b752570e2b4d",
+  "grid": [
+    48,
+    48
+  ],
+  "crop": {
+    "subjectBox": [
+      0,
+      0,
+      1023,
+      1023
+    ],
+    "cropTopFraction": 0.0,
+    "cropHeightFraction": 0.72,
+    "cropCenterXFraction": 0.5,
+    "squareSide": 737,
+    "cropTopPixels": 0,
+    "cropLeftPixels": 144
+  },
+  "background": {
+    "sampledRgb": [
+      249,
+      235,
+      248
+    ],
+    "tolerance": 48.0,
+    "alphaRule": "flood fill from the crop border only"
+  },
+  "postprocess": {
+    "paletteColors": 31,
+    "dither": false,
+    "saturation": 1.06,
+    "contrast": 1.1,
+    "gamma": 1.0,
+    "sharpenPercent": 40,
+    "autoLevels": true
+  },
+  "output": {
+    "width": 48,
+    "height": 50,
+    "embeddedPixelsBytes": 2400,
+    "paletteBytes": 93
+  },
+  "sha256": {
+    "devil-pixel.png": "b0e6dcd2f132c1d4b5061cdbcb1340a8c3e51491fdce2c7711844e4bf71daf52",
+    "devil_sprite.hpp": "1f05402909ff6fce0cb34644787292f221082121d4e3f3b25a363d9158e0c88f"
+  }
+}

@@ -1,0 +1,9 @@
+﻿negative: worst quality, low quality, blurry, jpeg artifacts, watermark, signature, text, logo, bad anatomy, bad hands, extra fingers, missing fingers, deformed face, extra limbs, cropped, out of frame, multiple girls, child, loli
+
+sampler: er_sde / simple / cfg 4.0 / 32 steps / 1024x1024
+model: anima-base-v1.0.safetensors + qwen_3_06b_base.safetensors + qwen_image_vae.safetensors
+loras: anima-highres-aesthetic-boost, anima-base-1-masterpiece-v51
+tool: ComfyUI Desktop workflow local/anima_txt2img (must run with --disable-dynamic-vram)
+
+prompt: masterpiece, very aesthetic, best quality, score_9, score_8, highres, absurdres, newest, year 2025, 1girl, solo, adult young woman, idol singer, long light pink and white twin tails, small decorative black horns, violet eyes, confident cheeky impish smile, elegant dark stage dress with lace, simple flat pale pink background, looking at viewer, head and shoulders portrait, close-up, centered composition, face fills frame, cel shading, clean bold linework, detailed face
+

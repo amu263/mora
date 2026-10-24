@@ -1,0 +1,51 @@
+{
+  "persona": "mushroom",
+  "source": "mushroom2.png",
+  "sourceSha256": "94fe0e26dccfb7f8614bc41759640722259ddc32600d04b4107d431109f58eab",
+  "grid": [
+    48,
+    48
+  ],
+  "crop": {
+    "subjectBox": [
+      36,
+      15,
+      991,
+      1023
+    ],
+    "cropTopFraction": 0.0,
+    "cropHeightFraction": 0.72,
+    "cropCenterXFraction": 0.5,
+    "squareSide": 737,
+    "cropTopPixels": 0,
+    "cropLeftPixels": 144
+  },
+  "background": {
+    "sampledRgb": [
+      255,
+      239,
+      217
+    ],
+    "tolerance": 48.0,
+    "alphaRule": "flood fill from the crop border only"
+  },
+  "postprocess": {
+    "paletteColors": 31,
+    "dither": false,
+    "saturation": 1.06,
+    "contrast": 1.1,
+    "gamma": 1.0,
+    "sharpenPercent": 40,
+    "autoLevels": true
+  },
+  "output": {
+    "width": 48,
+    "height": 50,
+    "embeddedPixelsBytes": 2400,
+    "paletteBytes": 93
+  },
+  "sha256": {
+    "mushroom-pixel.png": "47040da404bb850727718672c84e120e6b63e1c104242b2b6dea4d4a9f49b5ef",
+    "mushroom_sprite.hpp": "25929225d89e7f02131e6c4d2b227dd68568ea4e18f212d9bca82c26a54a5cae"
+  }
+}
