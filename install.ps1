@@ -116,7 +116,7 @@ foreach ($name in @('mora.exe','mora.com','mora.bat','mora.ps1')) {
         throw "Another command would conflict with MORA: $conflict"
     }
 }
-foreach ($name in @('docs','licenses','assets')) {
+foreach ($name in @('licenses')) {
     $source = Join-Path $PSScriptRoot $name
     if (Test-Path -LiteralPath $source) {
         Assert-OrdinaryTree $source
@@ -128,7 +128,7 @@ $targetExe = Join-Path $installRoot 'mora.exe'
 if (!(Get-FullPath $sourceExe).Equals($targetExe, [StringComparison]::OrdinalIgnoreCase)) {
     Copy-Item -LiteralPath $sourceExe -Destination $targetExe -Force
 }
-foreach ($name in @('README.md','DEVELOPMENT_PLAN.md','HANDOFF.md','THIRD-PARTY-NOTICES.md','LICENSE')) {
+foreach ($name in @('README.md','THIRD-PARTY-NOTICES.md','LICENSE')) {
     $source = Join-Path $PSScriptRoot $name
     $target = Join-Path $installRoot $name
     Assert-OrdinaryPath $target
@@ -137,12 +137,24 @@ foreach ($name in @('README.md','DEVELOPMENT_PLAN.md','HANDOFF.md','THIRD-PARTY-
         Copy-Item -LiteralPath $source -Destination $target -Force
     }
 }
-foreach ($name in @('docs','licenses','assets')) {
+foreach ($name in @('licenses')) {
     $source = Join-Path $PSScriptRoot $name
     $target = Join-Path $installRoot $name
     if ((Test-Path -LiteralPath $source -PathType Container) -and
         !(Get-FullPath $source).Equals($target, [StringComparison]::OrdinalIgnoreCase)) {
         Copy-TreeContents $source $target
+    }
+}
+$preview = Join-Path $PSScriptRoot 'docs\home-preview.png'
+if (Test-Path -LiteralPath $preview -PathType Leaf) {
+    Assert-OrdinaryPath $preview
+    $previewRoot = Join-Path $installRoot 'docs'
+    Assert-OrdinaryPath $previewRoot
+    New-Item -ItemType Directory -Path $previewRoot -Force | Out-Null
+    $targetPreview = Join-Path $previewRoot 'home-preview.png'
+    Assert-OrdinaryPath $targetPreview
+    if (!(Get-FullPath $preview).Equals($targetPreview, [StringComparison]::OrdinalIgnoreCase)) {
+        Copy-Item -LiteralPath $preview -Destination $targetPreview -Force
     }
 }
 # A source checkout carries license texts in vendor/, while release packages use licenses/.

@@ -122,6 +122,10 @@ namespace mora {
                    static_cast<std::streamsize>(encrypted.size()));
     }
 
+    void clearAgentKey() {
+        std::filesystem::remove(agentFile("agent.bin"));
+    }
+
     std::string loadAgentKey() {
         auto encrypted = readFile(agentFile("agent.bin"));
         if (encrypted.empty())

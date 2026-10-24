@@ -511,11 +511,13 @@ namespace mora {
              false, true);
     }
     void Api::logout() {
+        // Forget the encrypted local session entirely. A blank session file would still
+        // look like a saved login on the next launch.
+        std::filesystem::remove(directory / L"session.bin");
         cookies = Json::object();
         likes.clear();
         uid = 0;
         nickname = L"未登录";
-        save();
     }
     void Api::resume() {
         if (Clock::now() < blockedUntil)

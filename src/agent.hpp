@@ -43,6 +43,7 @@ namespace mora {
     void saveAgentConfig(const AgentConfig& config);
     bool agentKeyPresent();
     void saveAgentKey(const std::string& key);
+    void clearAgentKey();
     std::string loadAgentKey();
 
     // MCP tool definitions -> OpenAI function tools

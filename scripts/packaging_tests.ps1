@@ -26,6 +26,7 @@ function New-InstallFixture([string]$Name) {
     }
     Write-FixtureFile (Join-Path $source 'mora.exe') 'fixture executable'
     Write-FixtureFile (Join-Path $source 'docs\nested\plan.md') 'first revision'
+    Write-FixtureFile (Join-Path $source 'docs\home-preview.png') 'preview'
     Write-FixtureFile (Join-Path $source 'licenses\dependency.LICENSE') 'dependency license'
     Write-FixtureFile (Join-Path $source 'assets\amu\portrait.png') 'portrait'
     $local = Join-Path $root 'local'
@@ -47,15 +48,16 @@ try {
     $env:LOCALAPPDATA = $normal.local
     & (Join-Path $normal.source 'install.ps1') -CommandDir $normal.commands *> $null
     Assert-True (Test-Path -LiteralPath (Join-Path $normal.install 'mora.exe')) 'EXE missing.'
-    Assert-True (Test-Path -LiteralPath (Join-Path $normal.install 'docs\nested\plan.md')) 'Documentation missing.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $normal.install 'docs\home-preview.png')) 'Product preview missing.'
+    Assert-True (!(Test-Path -LiteralPath (Join-Path $normal.install 'docs\nested\plan.md'))) 'Private development docs entered installation.'
     Assert-True (Test-Path -LiteralPath (Join-Path $normal.install 'licenses\dependency.LICENSE')) 'Licenses missing.'
-    Assert-True (Test-Path -LiteralPath (Join-Path $normal.install 'assets\amu\portrait.png')) 'AMU assets missing from installation.'
+    Assert-True (!(Test-Path -LiteralPath (Join-Path $normal.install 'assets\amu\portrait.png'))) 'Source assets entered installation.'
     $shim = Get-Content -LiteralPath (Join-Path $normal.commands 'mora.cmd') -Raw
     Assert-True ($shim.Contains('DisableDelayedExpansion')) 'Shim must protect paths from delayed expansion.'
     Assert-True ($shim.Contains('%LOCALAPPDATA%\Programs\MORA\mora.exe')) 'Shim must use the current user installation.'
     Write-FixtureFile (Join-Path $normal.source 'docs\nested\plan.md') 'second revision'
     & (Join-Path $normal.source 'install.ps1') -CommandDir $normal.commands *> $null
-    Assert-True ((Get-Content -LiteralPath (Join-Path $normal.install 'docs\nested\plan.md') -Raw) -eq 'second revision') 'Reinstall did not update docs.'
+    Assert-True (!(Test-Path -LiteralPath (Join-Path $normal.install 'docs\nested\plan.md'))) 'Reinstall copied private docs.'
     Assert-True (!(Test-Path -LiteralPath (Join-Path $normal.install 'docs\docs'))) 'Reinstall nested docs/docs.'
     $record = Get-Content -LiteralPath (Join-Path $normal.install 'install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ($record.applicationId -eq 'mora-player') 'Installation ownership marker missing.'

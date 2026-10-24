@@ -16,7 +16,7 @@
 #include <shellapi.h>
 
 namespace mora {
-    enum class Modal { None, Login, Qr, Phone, Code, Save, Help, Quality, Guide, Ai, AiKey, AiModel, Agent, Settings, Name,
+    enum class Modal { None, SavedSession, Login, Qr, Phone, Code, Save, Help, Quality, Guide, Ai, AiKey, AiModel, Agent, Settings, Name,
                        Persona, Device };
     enum Action {
         A_Search = 1,
@@ -26,6 +26,8 @@ namespace mora {
         A_Library,
         A_Queue,
         A_Login,
+        A_UseSavedSession,
+        A_ForgetSavedSession,
         A_Previous,
         A_Pause,
         A_Next,
@@ -52,6 +54,7 @@ namespace mora {
         A_AI,
         A_AiKey,
         A_AiModel,
+        A_AiClearKey,
         A_Agent,
         A_Mascot,
         A_Name,
@@ -156,6 +159,12 @@ namespace mora {
         void editName() {
             modal = Modal::Name;
             fillInput(userName);
+        }
+        void showWelcomeIfNeeded() {
+            if (options.demo || options.seconds > 0 || !options.snapshot.empty())
+                return;
+            if (userName.empty()) editName();
+            else if (!guideDone) modal = Modal::Guide;
         }
         void finishGuide() {
             guideDone = true;
@@ -861,6 +870,10 @@ namespace mora {
         }
         void back() {
             if (modal != Modal::None) {
+                if (modal == Modal::SavedSession) {
+                    quit = true;
+                    return;
+                }
                 if (modal == Modal::Guide) {
                     finishGuide();
                     return;
@@ -960,6 +973,22 @@ namespace mora {
                 modal = Modal::Login;
                 searchFocus = false;
                 break;
+            case A_UseSavedSession:
+                if (!busy)
+                    submit("account", [](MusicService& s) {
+                        s.account();
+                        Reply r;
+                        r.type = "account";
+                        r.nickname = s.nickname();
+                        r.uid = s.uid();
+                        r.likes = s.likes();
+                        return r;
+                    });
+                break;
+            case A_ForgetSavedSession:
+                if (!busy)
+                    action(A_Logout);
+                break;
             case A_Previous:
                 if (!busy && session.move(-1))
                     playCurrent();
@@ -1056,6 +1085,14 @@ namespace mora {
                 input = unutf8(loadAgentConfig().model);
                 inputCursor = input.size();
                 break;
+            case A_AiClearKey:
+                try {
+                    clearAgentKey();
+                    message(L"本机模型密钥已清除；普通听歌仍可使用");
+                } catch (const std::exception&) {
+                    message(L"清除密钥失败，请检查本机配置目录");
+                }
+                break;
             case A_Name:
                 editName();
                 break;
@@ -1117,6 +1154,11 @@ namespace mora {
         // Adapter read-only network work runs on the shared worker so the MCP process never
         // needs its own HTTP stack or a second account session.
         void startIpc(std::string method, const Json& params, BridgeCompletion done) {
+            if (modal == Modal::SavedSession) {
+                done(BridgeReply(false, "account_confirmation_required",
+                                 "confirm the saved account in the terminal first", Json::object()));
+                return;
+            }
             uint64_t ticket = ++ipcSequence;
             auto query = params.value("query", std::string());
             auto kind = params.value("kind", std::string("song"));
@@ -1324,6 +1366,10 @@ namespace mora {
         // Runs on the UI thread through BridgeServer::pump: adapters only ever describe intent,
         // the session stays owned here.
         BridgeReply control(const std::string& method, const Json& params) {
+            if (modal == Modal::SavedSession && method != "hello")
+                return BridgeReply(false, "account_confirmation_required",
+                                   "confirm the saved account in the terminal first",
+                                   Json::object());
             auto busyReply = [] {
                 return BridgeReply(false, "busy",
                                    "the terminal player is finishing another request",
@@ -1432,6 +1478,13 @@ namespace mora {
                 fillInput(L"/");
                 return;
             }
+            if (modal == Modal::SavedSession) {
+                if (k.wVirtualKeyCode == VK_RETURN)
+                    action(A_UseSavedSession);
+                else if (k.wVirtualKeyCode == 'D')
+                    action(A_ForgetSavedSession);
+                return;
+            }
             if (modal == Modal::Login) {
                 if (c == L'1' || k.wVirtualKeyCode == VK_RETURN)
                     action(A_Qr);
@@ -1499,6 +1552,7 @@ namespace mora {
             if (modal == Modal::Ai) {
                 if (k.wVirtualKeyCode == 'K') action(A_AiKey);
                 else if (k.wVirtualKeyCode == 'M') action(A_AiModel);
+                else if (k.wVirtualKeyCode == 'D') action(A_AiClearKey);
                 return;
             }
             if (modal == Modal::AiKey || modal == Modal::AiModel) {
@@ -1886,11 +1940,13 @@ namespace mora {
                     likes = std::move(r.likes);
                     modal = Modal::None;
                     message(r.uid ? L"已登录 · " + nickname : L"当前为游客模式 · 按 L 登录");
+                    showWelcomeIfNeeded();
                 } else if (r.type == "logout") {
                     nickname = L"未登录";
                     likes.clear();
                     modal = Modal::None;
                     message(L"本机登录会话已清除");
+                    showWelcomeIfNeeded();
                 } else if (r.type == "like") {
                     if (r.code)
                         likes.insert(r.id);
@@ -2268,7 +2324,16 @@ namespace mora {
             auto txt = [&](int row, std::wstring_view s) {
                 c.text(x + 3, y + row, s, colors.text, w - 6);
             };
-            if (modal == Modal::Login) {
+            if (modal == Modal::SavedSession) {
+                txt(2, L"这台电脑保存过网易云音乐登录");
+                txt(4, L"会话属于当前 Windows 用户，未包含在下载包中。");
+                txt(6, L"请选择是否继续使用；不会在此之前访问账号。");
+                c.button(x + 3, y + 8, w - 6, L"Enter  继续使用本机账号",
+                         A_UseSavedSession, true);
+                c.button(x + 3, y + 10, w - 6, L"D  清除本机登录，改用游客模式",
+                         A_ForgetSavedSession);
+                txt(11, L"Esc 退出程序");
+            } else if (modal == Modal::Login) {
                 txt(2, L"账号 · 网易云音乐");
                 txt(4, nickname);
                 c.button(x + 3, y + 6, w - 6, L"1  扫码登录  /  Enter", A_Qr, true);
@@ -2408,14 +2473,14 @@ namespace mora {
             } else if (modal == Modal::Ai) {
                 auto config = loadAgentConfig();
                 txt(2, L"音乐 Agent · 模型设置");
-                txt(4, L"人设：" + persona.name + L" · " + persona.tagline);
-                txt(6, L"思考强度：" + effortLabel(config.reasoningEffort) +
-                           L" · /effort 可改（off→max）");
-                txt(8, L"模型：" + truncate(unutf8(config.model), w - 12));
-                txt(10, agentKeyPresent() ? L"密钥：已配置（DPAPI 保护）" : L"密钥：未配置");
-                c.button(x + 3, y + 12, w - 6, L"K  输入或替换模型密钥", A_AiKey);
-                c.button(x + 3, y + 14, w - 6, L"M  修改模型 ID", A_AiModel);
-                txt(17, L"/chat 开始对话；环境变量可覆盖当前模型设置。");
+                txt(3, L"人设：" + persona.name + L" · " + persona.tagline);
+                txt(4, L"思考强度：" + effortLabel(config.reasoningEffort));
+                txt(5, L"模型：" + truncate(unutf8(config.model), w - 12));
+                txt(6, agentKeyPresent() ? L"密钥：本机已配置（DPAPI 保护）" : L"密钥：本机未配置");
+                c.button(x + 3, y + 8, w - 6, L"K  输入或替换模型密钥", A_AiKey);
+                c.button(x + 3, y + 9, w - 6, L"M  修改模型 ID", A_AiModel);
+                c.button(x + 3, y + 10, w - 6, L"D  清除本机模型密钥", A_AiClearKey);
+                txt(11, L"/chat 对话；环境变量可覆盖模型设置。");
             } else if (modal == Modal::AiKey || modal == Modal::AiModel) {
                 bool secret = modal == Modal::AiKey;
                 txt(2, secret ? L"输入模型密钥" : L"输入模型 ID");
@@ -2598,10 +2663,14 @@ namespace mora {
             if (modal != Modal::None) {
                 bool allowed =
                     a == A_Close ||
+                    (modal == Modal::SavedSession &&
+                     (a == A_UseSavedSession || a == A_ForgetSavedSession)) ||
                     (modal == Modal::Login && (a == A_Qr || a == A_Phone || a == A_Logout)) ||
                     ((modal == Modal::Phone || modal == Modal::Code) && a == A_Send) ||
                     (modal == Modal::Save && a >= A_SaveRow && a < A_QualityRow) ||
                     (modal == Modal::Settings && (a == A_Name || a == A_Persona)) ||
+                    (modal == Modal::Ai &&
+                     (a == A_AiKey || a == A_AiModel || a == A_AiClearKey)) ||
                     (modal == Modal::Persona && a >= A_PersonaRow && a < A_DeviceRow) ||
                     (modal == Modal::Device && a >= A_DeviceRow) ||
                     (modal == Modal::Quality && a >= A_QualityRow);
@@ -2774,17 +2843,19 @@ namespace mora {
                     return 2;
                 }
             }
-            if (!options.demo && options.seconds <= 0 && options.snapshot.empty()) {
-                if (userName.empty()) editName();
-                else if (!guideDone) modal = Modal::Guide;
-            }
+            bool interactiveRun = !options.demo && options.seconds <= 0 && options.snapshot.empty();
+            bool savedSession = !options.demo && options.localAudio.empty() &&
+                                std::filesystem::exists(stateDirectory() / L"session.bin");
+            if (interactiveRun && savedSession && !options.playId)
+                modal = Modal::SavedSession;
+            else
+                showWelcomeIfNeeded();
             if (options.playId) {
                 home = false;
                 searchFocus = false;
                 session.assignId(options.playId);
                 playCurrent();
-            } else if (!options.demo && options.localAudio.empty() &&
-                       std::filesystem::exists(stateDirectory() / L"session.bin"))
+            } else if (savedSession && !interactiveRun)
                 submit("account", [](MusicService& s) {
                     s.account();
                     Reply r;

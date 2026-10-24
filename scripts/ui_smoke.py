@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ k.SetConsoleScreenBufferSize.argtypes=[w.HANDLE,Coord]
 k.GetConsoleMode.argtypes=[w.HANDLE,c.POINTER(w.DWORD)]
 k.SetConsoleMode.argtypes=[w.HANDLE,w.DWORD]
 k.CloseHandle.argtypes=[w.HANDLE]
+k.ReadConsoleOutputCharacterW.argtypes=[w.HANDLE,w.LPWSTR,w.DWORD,Coord,c.POINTER(w.DWORD)]
 
 allocated=bool(k.AllocConsole())
 window=k.GetConsoleWindow()
@@ -141,6 +143,45 @@ try:
             assert child.returncode==0
         finally:
             if child.poll() is None: child.terminate();child.wait(timeout=5)
+        with tempfile.TemporaryDirectory(prefix='mora-saved-session-') as isolated:
+            environment=dict(os.environ,MORA_DATA_DIR=isolated)
+            fixture="""Add-Type -AssemblyName System.Security
+$json='{"device":"fixture-device","cookies":{"MUSIC_U":"fixture-cookie-only"},"uid":42,"nickname":"fixture-user"}'
+$bytes=[Text.Encoding]::UTF8.GetBytes($json)
+$protected=[Security.Cryptography.ProtectedData]::Protect($bytes,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+[IO.File]::WriteAllBytes((Join-Path $env:MORA_DATA_DIR 'session.bin'),$protected)
+"""
+            subprocess.run(['powershell','-NoProfile','-Command',fixture],env=environment,
+                           check=True,capture_output=True,text=True)
+            saved_child=subprocess.Popen([str(ROOT/'build/mora.exe')],stdin=input_file,
+                                         stdout=output_file,stderr=output_file,
+                                         env=environment,startupinfo=startup)
+            try:
+                deadline=time.monotonic()+6
+                while time.monotonic()<deadline:
+                    lines=[]
+                    for row in range(36):
+                        buffer=c.create_unicode_buffer(116)
+                        read=w.DWORD()
+                        assert k.ReadConsoleOutputCharacterW(conout,buffer,116,Coord(0,row),c.byref(read))
+                        lines.append(buffer[:read.value])
+                    if '这台电脑保存过网易云音乐登录' in ''.join(lines):
+                        checks.append('saved account requires explicit choice')
+                        break
+                    time.sleep(.1)
+                else: raise AssertionError('saved account confirmation was not shown')
+                send(ord('D'),'d')
+                deadline=time.monotonic()+6
+                while time.monotonic()<deadline and (Path(isolated)/'session.bin').exists():
+                    time.sleep(.1)
+                assert not (Path(isolated)/'session.bin').exists(), 'local account file not cleared'
+                checks.append('forget saved account removes local session')
+                send(27);time.sleep(.15)
+                command('/quit')
+                saved_child.wait(timeout=5)
+                assert saved_child.returncode==0
+            finally:
+                if saved_child.poll() is None: saved_child.terminate();saved_child.wait(timeout=5)
     report={'passed':True,'checks':checks,'count':len(checks),'realWindowsConsoleInput':True}
     (ROOT/'build/ui-smoke.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
     print(json.dumps(report,ensure_ascii=True))

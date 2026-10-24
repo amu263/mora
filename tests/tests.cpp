@@ -322,6 +322,9 @@ int main() {
         CHECK(!noKey.ok && noKey.code == "missing_key");
         saveAgentKey("test-key-not-a-secret");
         CHECK(agentKeyPresent() && loadAgentKey() == "test-key-not-a-secret");
+        clearAgentKey();
+        CHECK(!agentKeyPresent() && !std::filesystem::exists(temporary / "agent.bin"));
+        saveAgentKey("test-key-not-a-secret");
         int modelCalls = 0, executed = 0;
         auto outcome = runChatLoop(
             AgentConfig{}, "找一首夜的钢琴曲",
@@ -841,6 +844,7 @@ int main() {
         f.close();
         restored.logout();
         CHECK(!restored.loggedIn());
+        CHECK(!std::filesystem::exists(fixtureDir / L"session.bin"));
     }
     int riskCalls = 0;
     Api risk(fixtureDir, [&](std::wstring, std::string, std::wstring, size_t, bool) {
