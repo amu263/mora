@@ -54,7 +54,7 @@ namespace mora {
                 response["result"] = Json{
                     {"protocolVersion", version},
                     {"capabilities", Json{{"tools", Json{{"listChanged", false}}}}},
-                    {"serverInfo", Json{{"name", "mora-music"}, {"version", "0.7.0-preview"}}},
+                    {"serverInfo", Json{{"name", "mora-music"}, {"version", "0.7.1-preview"}}},
                     {"instructions",
                      "MORA music sub-agent. music_search and music_open_collection return real "
                      "NetEase metadata, never stream URLs or account cookies; open_collection only "
