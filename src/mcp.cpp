@@ -54,7 +54,7 @@ namespace mora {
                 response["result"] = Json{
                     {"protocolVersion", version},
                     {"capabilities", Json{{"tools", Json{{"listChanged", false}}}}},
-                    {"serverInfo", Json{{"name", "mora-music"}, {"version", "0.7.1-preview"}}},
+                    {"serverInfo", Json{{"name", "mora-music"}, {"version", "0.7.2-preview"}}},
                     {"instructions",
                      "MORA music sub-agent. music_search and music_open_collection return real "
                      "NetEase metadata, never stream URLs or account cookies; open_collection only "
@@ -73,7 +73,11 @@ namespace mora {
                      "music_set_like and music_add_to_playlist use the signed-in player's account; "
                      "writes require an explicit target and are never retried automatically. "
                      "music_get_status reports whether a player is attached and whether the account "
-                     "is signed in (nickname only, never a credential). music_now_playing also "
+                     "is signed in (nickname only, never a credential). Requests are paced "
+                     "process-wide (at least 850 ms between reads, 3 s between writes) and account "
+                     "state is cached, so paging through a large list stays inside the service's "
+                     "limits; if the service still asks for a cooldown the call reports "
+                     "risk_cooldown instead of retrying. music_now_playing also "
                      "reports the lyric line being sung, and music_get_lyrics returns the bounded "
                      "timed lyrics."}};
                 phase = Phase::AwaitInitialized;

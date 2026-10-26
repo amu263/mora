@@ -31,7 +31,9 @@ namespace mora {
         Json cookies = Json::object(), publicKey;
         std::string device;
         std::filesystem::path directory;
-        Clock::time_point last{}, lastWrite{}, lastSms{}, blockedUntil{};
+        // Pacing and the risk cooldown are process-wide (see rateGate in api.cpp), so they survive
+        // an adapter that drops its Api between tool calls. Only the SMS window stays per instance.
+        Clock::time_point lastSms{};
         void load();
         void save();
         void mergeCookies(const Response& r);
@@ -50,6 +52,10 @@ namespace mora {
         explicit Api(std::filesystem::path dataDir = stateDirectory(), Transport adapter = {});
         Api(const Api&) = delete;
         Api& operator=(const Api&) = delete;
+        // Test seam: shrink the process-wide pacing windows so an offline suite that makes many
+        // stubbed calls does not spend its time sleeping. Production never calls this.
+        static void setPacingForTest(std::chrono::milliseconds readGap,
+                                     std::chrono::milliseconds writeGap);
         bool loggedIn() const;
         void account();
         SearchPage search(std::wstring query, Kind kind, int offset = 0);

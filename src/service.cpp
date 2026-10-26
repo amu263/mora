@@ -587,9 +587,11 @@ namespace mora {
     }
     void MusicService::useTransport(Api::Transport adapter) {
         // The injected transport survives releaseBackend(), so a thin adapter can drop and rebuild
-        // its backend between calls and still be exercised by the same deterministic stub.
+        // its backend between calls and still be exercised by the same deterministic stub. A new
+        // transport means a new backend identity, so cached account state must not leak across it.
         transport = std::move(adapter);
         api.reset();
+        clearAccountCache();
     }
     BridgeReply MusicService::session(const std::string& method, const Json& params) {
         if (!link)
@@ -645,40 +647,111 @@ namespace mora {
         backend().phoneLogin(std::move(phone), std::move(captcha));
     }
     void MusicService::account() {
-        backend().account();
+        auto& source = backend();
+        source.account();
+        cacheAccount(source);
     }
     void MusicService::like(int64_t id, bool value) {
         backend().like(id, value);
+        // Keep a warm cache truthful for our own writes instead of dropping it.
+        std::lock_guard lock(cacheMutex);
+        if (!cachedLikesValid)
+            return;
+        if (value)
+            cachedLikes.insert(id);
+        else
+            cachedLikes.erase(id);
     }
     void MusicService::save(int64_t song, int64_t playlist) {
         backend().add(song, playlist);
     }
     void MusicService::logout() {
         backend().logout();
+        clearAccountCache();
     }
     void MusicService::resume() {
         backend().resume();
     }
+    void MusicService::cacheAccount(const Api& source) const {
+        std::lock_guard lock(cacheMutex);
+        cachedUid = source.uid;
+        if (source.uid > 0)
+            cachedNickname = source.nickname;
+        cachedLikes = source.likes;
+        cachedLikesAt = Clock::now();
+        cachedLikesValid = true;
+    }
+    void MusicService::clearAccountCache() const {
+        std::lock_guard lock(cacheMutex);
+        cachedUid = 0;
+        cachedNickname.clear();
+        cachedLikes.clear();
+        cachedLikesAt = {};
+        cachedLikesValid = false;
+    }
+    void MusicService::invalidateLikes() const {
+        // A like written through the attached player is not visible in our cached set, so the next
+        // read refreshes instead of serving a stale answer.
+        std::lock_guard lock(cacheMutex);
+        cachedLikesValid = false;
+        cachedLikes.clear();
+    }
     std::wstring MusicService::nickname() const {
-        // Materialise the backend: the saved session already knows the nickname, and reporting
-        // "未登录" before the first network call was a lie after a restart. A damaged session file
-        // must fall back to the neutral value instead of taking the caller down with it.
+        // Materialise the backend unless the cache already knows the account: the saved session
+        // knows the nickname, and reporting "未登录" before the first network call was a lie after
+        // a restart. A damaged session file falls back to the neutral value instead of throwing.
+        {
+            std::lock_guard lock(cacheMutex);
+            if (cachedUid > 0 && !cachedNickname.empty())
+                return cachedNickname;
+        }
         try {
-            return backend().nickname;
+            auto& source = backend();
+            std::lock_guard lock(cacheMutex);
+            cachedUid = source.uid;
+            if (source.uid > 0)
+                cachedNickname = source.nickname;
+            return cachedNickname.empty() ? L"未登录" : cachedNickname;
         } catch (const std::exception&) {
             return L"未登录";
         }
     }
     int64_t MusicService::uid() const {
+        {
+            std::lock_guard lock(cacheMutex);
+            if (cachedUid > 0)
+                return cachedUid;
+        }
         try {
-            return backend().uid;
+            auto& source = backend();
+            std::lock_guard lock(cacheMutex);
+            cachedUid = source.uid;
+            if (source.uid > 0)
+                cachedNickname = source.nickname;
+            return cachedUid;
         } catch (const std::exception&) {
             return 0;
         }
     }
     std::set<int64_t> MusicService::likes() const {
+        // Liked ids are network state, so the first read hydrates them once; afterwards the cache
+        // answers (bounded TTL) and a paging host costs one metadata request per page instead of a
+        // full account round trip per tool call.
+        constexpr auto ttl = std::chrono::minutes(5);
+        {
+            std::lock_guard lock(cacheMutex);
+            if (cachedLikesValid && Clock::now() - cachedLikesAt < ttl)
+                return cachedLikes;
+        }
         try {
-            return backend().likes;
+            auto& source = backend();
+            // Only a signed-in session has liked ids to fetch; asking while signed out would spend
+            // a request to learn nothing.
+            if (source.loggedIn() && (source.uid <= 0 || source.likes.empty()))
+                source.account();
+            cacheAccount(source);
+            std::lock_guard lock(cacheMutex);
+            return cachedLikes;
         } catch (const std::exception&) {
             return {};
         }
@@ -1061,17 +1134,9 @@ namespace mora {
                 }
             };
             auto fillFromLikes = [&]() {
-                // Liked ids are account state, restored by account() rather than by session.bin.
-                auto liked = likes();
-                if (liked.empty()) {
-                    try {
-                        account();
-                    } catch (const ApiError& error) {
-                        throwApiError(error);
-                    }
-                    liked = likes();
-                }
-                for (auto id : liked) {
+                // likes() hydrates once and caches afterwards, so this costs no extra account
+                // round trip when the host calls the liked tools back to back.
+                for (auto id : likes()) {
                     if (id > 0 && seen.insert(id).second)
                         ids.push_back(id);
                     if ((int)ids.size() >= count)
@@ -1315,17 +1380,10 @@ namespace mora {
             onlyArguments(args, {"limit", "offset"});
             int limit = boundedInteger(args, "limit", 20, 1, 50);
             int offset = boundedInteger(args, "offset", 0, 0, 5000);
-            // The liked ids are account state, populated by account() rather than by session.bin,
-            // so a cold start refreshes them once instead of reporting an empty hearted list.
+            // likes() hydrates the account once (they are network state, not session state) and
+            // then answers from the bounded cache, so a host paging the list does not rebuild the
+            // account state on every call.
             auto liked = likes();
-            if (liked.empty()) {
-                try {
-                    account();
-                } catch (const ApiError& error) {
-                    throwApiError(error);
-                }
-                liked = likes();
-            }
             // Two very different causes, two codes: a signed-out session is fixable by the user,
             // an empty liked list is simply empty.
             if (liked.empty() && uid() == 0)
@@ -1365,16 +1423,6 @@ namespace mora {
             onlyArguments(args, {"songId"});
             int64_t songId = positiveInteger(args, "songId");
             auto liked = likes();
-            if (liked.empty()) {
-                try {
-                    account();
-                } catch (const ApiError& error) {
-                    throwApiError(error);
-                } catch (const std::runtime_error& error) {
-                    throw ToolError("session_error", error.what());
-                }
-                liked = likes();
-            }
             if (uid() == 0)
                 throw ToolError("needs_login",
                                 "not signed in to a music account; sign in in the terminal first");
@@ -1396,6 +1444,9 @@ namespace mora {
                 throw ToolError(reply.code.empty() ? "player_error" : reply.code,
                                 reply.message.empty() ? "the player rejected the like request"
                                                       : reply.message);
+            // The write happened in the player, so our cached liked set is now stale by exactly this
+            // one song: refresh it on the next read instead of answering wrongly.
+            invalidateLikes();
             return Json{{"songId", songId},
                         {"liked", liked},
                         {"state", liked ? "liked" : "unliked"}};

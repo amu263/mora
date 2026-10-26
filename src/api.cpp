@@ -1,9 +1,33 @@
 #include "api.hpp"
 #include "miniz_tinfl.h"
 #include <fstream>
+#include <mutex>
 #include <thread>
 
 namespace mora {
+    namespace {
+        // Pacing is process-wide on purpose. A thin MCP adapter drops and rebuilds its Api between
+        // tool calls to keep memory small, and per-instance pacing let every call start a fresh
+        // burst - which is what tripped the server's risk control after ~20 rapid read calls. The
+        // gate also serializes concurrent callers, matching the "requests stay serialized" rule.
+        struct RateGate {
+            std::mutex mutex;
+            Clock::time_point last{};
+            Clock::time_point lastWrite{};
+            Clock::time_point blockedUntil{};
+            std::chrono::milliseconds readGap{850};
+            std::chrono::milliseconds writeGap{3000};
+        };
+        RateGate& rateGate() {
+            static RateGate gate;
+            return gate;
+        }
+        void blockForRiskCooldown() {
+            auto& gate = rateGate();
+            std::lock_guard lock(gate.mutex);
+            gate.blockedUntil = Clock::now() + std::chrono::minutes(5);
+        }
+    } // namespace
     static std::string timestamp() {
         return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
@@ -133,16 +157,29 @@ namespace mora {
         return out;
     }
     void Api::throttle(bool write) {
+        auto& gate = rateGate();
+        // Sleeping under the lock is deliberate: a concurrent caller waits its turn instead of
+        // racing past the same window, so two adapters cannot double the request rate.
+        std::lock_guard lock(gate.mutex);
         auto now = Clock::now();
-        if (now < blockedUntil)
+        if (now < gate.blockedUntil)
             throw ApiError(429, "风控冷却中，五分钟后按 R 手动恢复；请勿连续登录");
-        auto due = std::max(last + std::chrono::milliseconds(850),
-                            write ? lastWrite + std::chrono::seconds(3) : last);
+        auto due = std::max(gate.last + gate.readGap,
+                            write ? gate.lastWrite + gate.writeGap : gate.last);
         if (now < due)
             std::this_thread::sleep_until(due);
-        last = Clock::now();
+        gate.last = Clock::now();
         if (write)
-            lastWrite = last;
+            gate.lastWrite = gate.last;
+    }
+    void Api::setPacingForTest(std::chrono::milliseconds readGap,
+                               std::chrono::milliseconds writeGap) {
+        auto& gate = rateGate();
+        std::lock_guard lock(gate.mutex);
+        gate.readGap = readGap;
+        gate.writeGap = writeGap;
+        gate.last = {};
+        gate.lastWrite = {};
     }
     bool Api::loggedIn() const {
         return cookies.contains("MUSIC_U") && cookies["MUSIC_U"].is_string() &&
@@ -197,7 +234,7 @@ namespace mora {
         auto response = request(url, body, headers);
         mergeCookies(response);
         if (isRiskCode(response.status)) {
-            blockedUntil = Clock::now() + std::chrono::minutes(5);
+            blockForRiskCooldown();
             throw ApiError(response.status,
                            "服务端要求验证或限流，已暂停请求五分钟；可使用官方客户端完成验证");
         }
@@ -211,7 +248,7 @@ namespace mora {
             throw ApiError(0, "服务端响应格式已变化，请更新播放器");
         int code = result.value("code", 200);
         if (isRiskCode(code)) {
-            blockedUntil = Clock::now() + std::chrono::minutes(5);
+            blockForRiskCooldown();
             throw ApiError(code,
                            "账号触发验证或限流，已暂停请求；请到官方客户端完成验证，五分钟后按 R");
         }
@@ -244,12 +281,12 @@ namespace mora {
                          L"(Linux; U; Android 12; HBN-AL00 Build/cd737a2.0)\r\nCookie: deviceId=" +
                              unutf8(device) + L"\r\n");
         if (isRiskCode(r.status)) {
-            blockedUntil = Clock::now() + std::chrono::minutes(5);
+            blockForRiskCooldown();
             throw ApiError(r.status, "播放服务限流，已进入五分钟冷却");
         }
         auto j = Json::parse(r.body);
         if (isRiskCode(j.value("code", 0)))
-            blockedUntil = Clock::now() + std::chrono::minutes(5);
+            blockForRiskCooldown();
         if (j.value("code", 0) != 200 || !j.contains("data"))
             throw ApiError(j.value("code", 0), "无法取得播放协议密钥，请稍后重试");
         auto d = j["data"];
@@ -539,8 +576,10 @@ namespace mora {
         nickname = L"未登录";
     }
     void Api::resume() {
-        if (Clock::now() < blockedUntil)
+        auto& gate = rateGate();
+        std::lock_guard lock(gate.mutex);
+        if (Clock::now() < gate.blockedUntil)
             throw ApiError(429, "冷却尚未结束，请稍后重试");
-        blockedUntil = {};
+        gate.blockedUntil = {};
     }
 } // namespace mora

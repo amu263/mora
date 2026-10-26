@@ -5,6 +5,8 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <mutex>
+#include <set>
 
 namespace mora {
     // A tool-level failure with a machine-readable code. mcp.cpp turns it into result.isError so
@@ -31,6 +33,20 @@ namespace mora {
         std::map<std::string, std::vector<Candidate>> candidateSets;
         std::deque<std::string> candidateOrder;
         uint64_t candidateSerial = 0;
+        // Account state outlives releaseBackend(). A thin adapter rebuilds its Api between tool
+        // calls, and re-reading uid/nickname/likes meant two extra account requests per call - the
+        // amplifier behind the risk-control trip when a host paged the liked list. account() and
+        // our own like() refresh it, logout() clears it, and like reads expire so an outside
+        // change is still noticed.
+        mutable std::mutex cacheMutex;
+        mutable int64_t cachedUid = 0;
+        mutable std::wstring cachedNickname;
+        mutable std::set<int64_t> cachedLikes;
+        mutable Clock::time_point cachedLikesAt{};
+        mutable bool cachedLikesValid = false;
+        void cacheAccount(const Api& source) const;
+        void clearAccountCache() const;
+        void invalidateLikes() const;
         Api& backend() const;
         BridgeReply session(const std::string& method, const Json& params);
         Json searchTool(std::wstring query, Kind kind, int offset, int limit);

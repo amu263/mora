@@ -71,7 +71,7 @@ int main() {
                 auto k = value();
                 kind = k == L"album" ? Kind::Album : k == L"playlist" ? Kind::Playlist : Kind::Song;
             } else if (a == L"--version") {
-                std::cout << "MORA 0.7.1-preview / Windows x64 native\n";
+                std::cout << "MORA 0.7.2-preview / Windows x64 native\n";
                 LocalFree(args);
                 return 0;
             } else if (a == L"--help") {

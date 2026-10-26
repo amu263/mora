@@ -110,8 +110,8 @@ try {
     }
     & (Join-Path $packageRoot 'scripts\package.ps1') *> $null
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $binaryZip = Join-Path $packageRoot 'dist\MORA-0.7.1-preview-win-x64.zip'
-    $sourceZip = Join-Path $packageRoot 'dist\MORA-0.7.1-preview-source.zip'
+    $binaryZip = Join-Path $packageRoot 'dist\MORA-0.7.2-preview-win-x64.zip'
+    $sourceZip = Join-Path $packageRoot 'dist\MORA-0.7.2-preview-source.zip'
     foreach ($zipPath in @($binaryZip,$sourceZip)) {
         $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
         try {
@@ -137,7 +137,7 @@ try {
     & (Join-Path $packageRoot 'scripts\package.ps1') *> $null
     Assert-True ((Get-FileHash -LiteralPath $binaryZip -Algorithm SHA256).Hash -eq $firstHash) 'Identical input produced a different binary archive.'
     Assert-True ((Get-FileHash -LiteralPath $sourceZip -Algorithm SHA256).Hash -eq $sourceHash) 'Identical input produced a different source archive.'
-    $release = Join-Path $packageRoot 'dist\MORA-0.7.1-preview-win-x64'
+    $release = Join-Path $packageRoot 'dist\MORA-0.7.2-preview-win-x64'
     Assert-True (!(Test-Path -LiteralPath (Join-Path $release 'docs\docs'))) 'Repeated packaging nested docs.'
     Write-FixtureFile (Join-Path $release 'keep.txt') 'unrelated addition'
     $refused = $false

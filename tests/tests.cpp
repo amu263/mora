@@ -33,6 +33,10 @@ static int checks = 0;
 using namespace mora;
 
 int main() {
+    // The pacing gate is process-wide and real requests are paced at 850 ms; an offline suite that
+    // makes hundreds of stubbed calls must not spend its time sleeping. The dedicated pacing check
+    // below installs the production windows explicitly and restores this afterwards.
+    Api::setPacingForTest(std::chrono::milliseconds(0), std::chrono::milliseconds(0));
     // A model call runs on the worker, while playback and control stay on the UI thread.
     {
         MainThreadToolCalls calls;
@@ -630,6 +634,74 @@ int main() {
         CHECK(hearted["liked"] == true && hearted["likedTotal"] == 5);
         auto stranger = fromLikes.invoke("music_get_like", Json{{"songId", 999}});
         CHECK(stranger["liked"] == false);
+        // Paging the liked list must not rebuild account state per call: an external host walking
+        // many pages used to spend two account requests per page, which is what tripped the
+        // server's risk control.
+        int pagingCalls = 0;
+        auto counting = [&](std::wstring url, std::string, std::wstring, size_t,
+                            bool) -> Response {
+            ++pagingCalls;
+            Response response;
+            response.status = 200;
+            if (url.find(L"account/get") != std::wstring::npos)
+                response.body = R"({"code":200,"profile":{"userId":42,"nickname":"fixture-me"}})";
+            else if (url.find(L"like/get") != std::wstring::npos)
+                response.body = R"({"code":200,"ids":[101,102,103,104,105]})";
+            else
+                response.body = R"({"code":200})";
+            return response;
+        };
+        fromLikes.useTransport(counting);
+        for (int page = 0; page < 5; ++page) {
+            fromLikes.invoke("music_list_likes", Json{{"limit", 2}, {"offset", page * 2}});
+            fromLikes.releaseBackend(); // exactly what the thin adapter does between tool calls
+        }
+        // Two account requests for the whole run (uid + liked ids), then the cache answers; each
+        // page still resolves its own two rows of metadata.
+        CHECK(pagingCalls <= 8);
+        std::filesystem::remove_all(temporary);
+        SetEnvironmentVariableW(L"MORA_DATA_DIR", previousDir.empty() ? nullptr
+                                                                     : previousDir.c_str());
+    }
+    // Cross-call pacing: the request gate lives in the process, not in one Api instance, so an
+    // adapter that drops its backend between tool calls (which is what keeps its memory small)
+    // cannot restart the burst that tripped the server's risk control.
+    {
+        auto previousDir = []() {
+            std::wstring buffer(1024, L'\0');
+            auto size = GetEnvironmentVariableW(L"MORA_DATA_DIR", buffer.data(), 1024);
+            return size > 0 ? std::wstring(buffer.data(), size) : std::wstring();
+        }();
+        auto temporary = std::filesystem::temp_directory_path() / "mora-pacing-test";
+        std::filesystem::remove_all(temporary);
+        SetEnvironmentVariableW(L"MORA_DATA_DIR", temporary.wstring().c_str());
+        std::vector<std::chrono::steady_clock::time_point> stamps;
+        auto transport = [&](std::wstring url, std::string, std::wstring, size_t,
+                             bool) -> Response {
+            stamps.push_back(std::chrono::steady_clock::now());
+            Response response;
+            response.status = 200;
+            response.body = url.find(L"qrcode/unikey") != std::wstring::npos
+                                ? R"({"code":200,"unikey":"paced-key"})"
+                                : R"({"code":200})";
+            return response;
+        };
+        MusicService paced;
+        paced.useTransport(transport);
+        // Production windows, explicitly installed for this check.
+        Api::setPacingForTest(std::chrono::milliseconds(850), std::chrono::seconds(3));
+        paced.qrKey();
+        paced.releaseBackend();
+        paced.qrKey();
+        CHECK(stamps.size() == 2);
+        CHECK(stamps.size() == 2 && stamps[1] - stamps[0] >= std::chrono::milliseconds(700));
+        // A second service in the same process shares the gate, so two adapters cannot double the
+        // request rate.
+        MusicService neighbour;
+        neighbour.useTransport(transport);
+        neighbour.qrKey();
+        CHECK(stamps.size() == 3 && stamps[2] - stamps[1] >= std::chrono::milliseconds(700));
+        Api::setPacingForTest(std::chrono::milliseconds(0), std::chrono::milliseconds(0));
         std::filesystem::remove_all(temporary);
         SetEnvironmentVariableW(L"MORA_DATA_DIR", previousDir.empty() ? nullptr
                                                                      : previousDir.c_str());

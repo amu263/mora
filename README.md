@@ -8,7 +8,7 @@ MORA 是一款 Windows 终端音乐播放器，支持网易云音乐搜索与播
 
 ## 下载与启动
 
-1. 打开 [Windows 预览版下载页](https://github.com/amu263/mora/releases/tag/v0.7.1-preview)，下载名称带 **`win-x64`** 的 ZIP。
+1. 打开 [Windows 预览版下载页](https://github.com/amu263/mora/releases/tag/v0.7.2-preview)，下载名称带 **`win-x64`** 的 ZIP。
 2. 解压整个 ZIP。解压后的目录顶层应能看到 **`mora.exe`**、`mora.cmd` 和 `install.cmd`。
 3. 在该目录双击 `mora.cmd`；从终端启动时，先进入解压目录，再运行 `.\mora.cmd`（CMD 与 PowerShell 均可）。
 
