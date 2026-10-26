@@ -45,6 +45,7 @@ namespace mora {
     std::wstring personaWaitLine(const Persona& persona, int index);
     // Turns the persona's taste into a bounded search seed for music_recommend.
     std::wstring personaSearchSeed(const Persona& persona);
+    bool usePersonaSearchSeed(const std::wstring& request);
 
     // Persona avatar box. Every built-in avatar is 48x50, matching the original Amu sprite.
     inline constexpr int personaAvatarWidth = 48, personaAvatarHeight = 50;

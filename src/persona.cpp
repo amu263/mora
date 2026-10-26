@@ -276,35 +276,15 @@ namespace mora {
         return prompt;
     }
 
-    std::wstring personaIntentGuidance(const Persona& persona) {
-        // The same bounded rules for every persona, fronted by one line in that persona's own
-        // voice so a vague request ("随便来点歌") still turns into an action instead of a question.
-        static const std::map<std::string, const wchar_t*> openers{
-            {"amu", L"我懂你的意思，能猜到就直接给你放上，不磨叽。"},
-            {"fox", L"别跟我绕，意思到了我直接上歌。"},
-            {"devil", L"台上时间宝贵，能听懂就直接开场。"},
-            {"mushroom", L"我会轻轻接住你的意思，直接帮你放上。"},
-            {"daidai", L"唔……我大概懂啦，直接放给你听。"},
-        };
-        auto found = openers.find(persona.id);
-        std::wstring guidance =
-            found != openers.end()
-                ? std::wstring(found->second)
-                : L"我会先理解你的意思，再直接动手，最多确认一次。";
-        guidance +=
-            L"【怎么动手】能推断就直接搜索或推荐并播放，不要反复确认，也不要只在嘴上介绍；"
-            L"单曲→music_search 后 music_play(kind=song)；"
-            L"专辑/歌单→music_play 或 music_open_collection(kind=album|playlist)，整张替换队列连续播放；"
-            L"歌手/风格/场景/心情→music_search(query, limit 10..30) 取一组 id 后 "
-            L"music_queue_edit(op=replace, ids=[…]) 一次建立多首队列并从第一首开始，不要只播一首；"
-            L"真的不确定→music_recommend + music_play_random。"
-            L"“换成 / 只听 / 播放这张专辑”=替换队列；“再加上 / 再来点 / 接着放 / 排在后面”"
-            L"=append 或 add_next，不得替换当前队列。"
-            L"系列请求取回 5..20 首（有界，最多 50）。工具返回 accepted 后必须用 music_now_playing "
-            L"确认真实状态，不得编造播放结果。";
-        return guidance;
+    std::wstring personaIntentGuidance(const Persona&) {
+        return L"【意图边界】闲聊、问候、评价歌曲、询问看法时只自然回答，不搜索、不推荐、不播放、不修改队列。提到‘正在播放的歌’只是谈话上下文，不是播放命令。只有用户明确要求播放、换歌、追加、暂停、收藏等操作时才调用对应工具。"
+               L"多首并播放：按取向→music_recommend_queue(intent=人设推歌取向,count=首数)；"
+               L"从用户歌单→music_recommend_queue(source=playlists,count=首数)；"
+               L"用户喜欢的歌/红心→music_recommend_queue(source=liked,count=首数)（只看清单用 music_list_likes）；"
+               L"已有 id 时用一次 music_queue_edit(op=replace, ids=[…]) 批量入队，禁止逐首播放；"
+               L"换音质用 music_control(action=quality, level=standard|higher|exhigh|lossless|hires)；"
+               L"以实际 queuedCount 为准，不足要说明；只推荐不播放时不得修改队列。操作成功后简短答复，不重复调用写工具。";
     }
-
     std::wstring personaWaitLine(const Persona& persona, int index) {
         // One short corpus per built-in, in the persona's own voice. It stays small on purpose: the
         // contract only needs a few rotating lines, not a second personality description.
@@ -340,20 +320,25 @@ namespace mora {
     }
 
     std::wstring personaSearchSeed(const Persona& persona) {
-        switch (stableHash(persona.id) % 5) {
-        case 0:
-            return L"华语流行 民谣 老歌";
-        case 1:
-            return L"日语流行 动画歌";
-        case 2:
-            return L"芭乐 情歌 R&B";
-        case 3:
-            return L"小甜歌 轻音乐 治愈";
-        default:
-            return L"钢琴 轻音乐";
-        }
+        if (persona.id == "amu") return L"流行音乐 钢琴 电子 老歌";
+        if (persona.id == "fox") return L"华语流行 民谣 摇滚 老歌";
+        if (persona.id == "devil") return L"日语流行 动画 J-ROCK 电子";
+        if (persona.id == "mushroom") return L"轻音乐 治愈 钢琴";
+        if (persona.id == "daidai") return L"钢琴 轻音乐 治愈";
+        auto end = persona.taste.find_first_of(L"，、。；,;/");
+        auto seed = persona.taste.substr(0, std::min(end, size_t(30)));
+        return seed.empty() ? L"流行音乐" : seed;
     }
 
+    bool usePersonaSearchSeed(const std::wstring& request) {
+        bool genericTaste = request.find(L"品味") != std::wstring::npos ||
+                            request.find(L"口味") != std::wstring::npos ||
+                            request.find(L"随便") != std::wstring::npos;
+        bool shortRandom = request.find(L"随机") != std::wstring::npos &&
+                           request.size() <= 12;
+        return (genericTaste || shortRandom) &&
+               request.find(L"的歌") == std::wstring::npos;
+    }
     bool personaHasDrawnAvatar(const std::string& id) {
         if (id == "amu")
             return true;

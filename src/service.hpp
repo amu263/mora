@@ -20,13 +20,18 @@ namespace mora {
     // (M3) the model tool loop all call this service; none of them talks to Api directly, and none
     // of them keeps a private queue or playback state.
     class MusicService {
-        std::unique_ptr<Api> api;
+        // Lazily created, logically const: the stored session already knows the account id and
+        // nickname, so reading them must never report "not logged in" merely because no network
+        // call has happened yet. (Likes are network state, not session state: only account()
+        // fills them, exactly as before.)
+        mutable std::unique_ptr<Api> api;
+        Api::Transport transport;
         std::function<BridgeReply(const std::string&, const Json&)> link;
         // Bounded memory of the last few recommendation sets, so play_random can refer back to one.
         std::map<std::string, std::vector<Candidate>> candidateSets;
         std::deque<std::string> candidateOrder;
         uint64_t candidateSerial = 0;
-        Api& backend();
+        Api& backend() const;
         BridgeReply session(const std::string& method, const Json& params);
         Json searchTool(std::wstring query, Kind kind, int offset, int limit);
         Json collectionTool(const std::string& kind, int64_t id, int offset, int limit);
@@ -46,6 +51,10 @@ namespace mora {
         // pipe; a future in-process agent points it at the session directly.
         void attach(std::function<BridgeReply(const std::string&, const Json&)> handler);
         bool attached() const;
+        // Test seam: build the network backend over an injected transport instead of the real
+        // WinHTTP one. The tool boundary itself is unchanged, so tests exercise the real
+        // projection, ordering and permission logic offline.
+        void useTransport(Api::Transport adapter);
         // Thin adapters (MCP) drop the network backend between calls instead of holding TLS
         // buffers for the whole host session.
         void releaseBackend();

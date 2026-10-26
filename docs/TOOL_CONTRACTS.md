@@ -2,25 +2,54 @@
 
 机器可读清单由 `src/service.cpp::musicToolDefinitions()` 产生，通过 `tools/list` 返回；本文记录同一份契约与执行语义。**工具名和参数以运行中的 `tools/list` 为准。**
 
-## 当前工具（M4-A）
+## 当前工具（17 个，随版本演进）
 
 | 工具 | 状态 | 输入 | 输出/约束 |
 | --- | --- | --- | --- |
-| `music_search` | 已接通 | query, kind, limit, offset | 真实元数据，最多 30 条；无 Cookie、播放 URL；不自动播放。歌手/风格/场景/心情类系列请求：`limit 10..30` 取回一组 id，再用 `music_queue_edit(op="replace", ids=[…])` 建 5..20 首队列 |
-| `music_open_collection` | 已接通 | kind(album/playlist), id, offset, limit | 按需曲目页（最多 100 条），只返回 ID/名称/时长，不返回播放地址，不自动播放 |
+| `music_search` | 已接通 | query, kind, limit, offset | 真实元数据，最多 30 条；无 Cookie、播放 URL；不自动播放。歌手/风格/场景/心情类系列请求优先用 `music_recommend_queue`（一次建队并入队），或取回一组 id 后用 `music_queue_edit(op="replace", ids=[…])` |
+| `music_open_collection` | 已接通 | kind(album/playlist), id, offset, limit | 按需曲目页（最多 100 条），`offset` 是**真分页**；本页歌名为空的曲目会额外补一次详情（每次 ≤50 个 id），不返回播放地址，不自动播放 |
 | `music_play` | 已接通（需 TUI） | kind(song/album/playlist), id, startIndex | 提交到**同一个** TUI 播放会话；song 用该曲替换队列，album/playlist 用**整个集合替换队列**并从 startIndex 开始（整张专辑/歌单走这里）；返回 accepted，真实播放状态用 `music_now_playing` 查询；无播放器时 `needs_player` |
-| `music_control` | 已接通（需 TUI） | action(pause/resume/next/previous/seek/volume), value | 修改同一会话；seek 单位为秒，volume 为 0..100；不创建第二个播放器；无播放器时 `needs_player` |
-| `music_now_playing` | 已接通（需 TUI） | 空对象 | 真实状态：曲目、队列位置、暂停、进度、音量、循环、账号实际获得的音质与采样率 |
-| `music_get_status` | 已接通 | 空对象 | 能力清单 + `playerSessionAttached` + 当前会话快照；未连接时必须为 false |
-| `music_list_playlists` | 已接通（真实账号） | ownedOnly, limit, offset | 真实用户歌单；`canWrite` 由播放器按归属判断，适配器不得自行猜测 |
+| `music_control` | 已接通（需 TUI） | action(pause/resume/next/previous/seek/volume/quality), value, level | 修改同一会话；seek 单位为秒，volume 为 0..100；`quality` 需要 `level`（`standard/higher/exhigh/lossless/hires`），从下一首生效，实际档位仍取决于账号权限；不创建第二个播放器；无播放器时 `needs_player` |
+| `music_now_playing` | 已接通（需 TUI） | 空对象 | 真实状态：曲目、队列位置、暂停、进度、音量、循环、账号实际获得的音质与采样率、正在唱的歌词行 |
+| `music_get_lyrics` | 已接通 | songId, includeTranslation, maxLines, fromCurrent | 有界时间轴歌词（≤200 行）；不含流地址；没有播放器时按 songId 只读读取 |
+| `music_get_status` | 已接通 | 空对象 | 能力清单 + `playerSessionAttached` + 当前会话快照 + 只读 `account:{signedIn,nickname}`（不含任何凭据）；未连接时 `playerSessionAttached` 必须为 false，本地会话文件损坏时仍返回可用结果（`signedIn:false`） |
+| `music_list_playlists` | 已接通（真实账号） | ownedOnly（默认 false，含收藏） , limit ≤ 50, offset | 真实用户歌单；`canWrite` 由播放器按归属判断，适配器不得自行猜测 |
+| `music_list_likes` | 已接通（真实账号） | limit ≤ 50, offset ≤ 5000 | 只读分页红心歌曲；冷启动先刷新一次账号红心集合；未登录 `needs_login`，真空红心 `no_likes` |
+| `music_get_like` | 已接通（真实账号） | songId | 单曲是否已红心：`{songId, liked, likedTotal}`；只读，避免为判断一首歌而翻完整红心列表 |
 | `music_set_like` | 已接通（真实账号） | songId, liked | 幂等的目标状态，不使用 toggle 语义；可重放 |
-| `music_add_to_playlist` | 已接通（真实账号；真实入库待用户指定歌单） | songId, playlistId, operationId | 只允许自己拥有的歌单（先校验再写，否则 `no_permission`）；重复映射 `already_present`；不自动重试 |
+| `music_add_to_playlist` | 已接通（真实账号） | songId, playlistId, operationId | 只允许自己拥有的歌单（先校验再写，否则 `no_permission`）；重复映射 `already_present`；不自动重试 |
+| `music_recommend_queue` | 已接通（需 TUI） | intent, count(默认 30，1..1000), source(auto/search/playlists/liked), seed | **一次调用**选出真实曲目、替换队列并从第一首开始播放；见下方专节 |
 | `music_recommend` | 已接通（M5） | intent, source(auto/search/playlists), limit, seed | 有真实 ID 的候选与理由；**绝不播放、不收藏**；返回 `candidateSetId` |
 | `music_play_random` | 已接通（M5） | candidateSetId 或 intent, seed | 从实际候选随机挑一首（排除正在播放的），提交给播放器；不会自动换曲重试 |
 | `music_queue_list` | 已接通（M8；需 TUI） | limit ≤ 100, offset | 只读投影当前队列：`total`、0 基 `index`、`mode`、`repeat`、有界行窗口（`id/name/artist/album/durationSeconds/current`）；不返回流地址或 Cookie |
 | `music_queue_edit` | 已接通（M8；需 TUI） | op, mode, seed, index, from, to, id, ids | 单次一个写操作：`set_mode/play_index/remove/move/clear/add_next/append/replace`；索引 **0 基**，与 `music_play.startIndex` 相同；越界与未知字段 `invalid_arguments`；无播放器 `needs_player`；不自动重试 |
 
-工具级失败（参数非法、没有播放器、播放器忙）返回 `result.isError:true`，并在 `structuredContent` 给出机器可读的 `error`：`invalid_arguments`、`needs_player`、`busy`、`queue_boundary`、`unknown_method`、`disconnected`。协议层错误（未知工具、畸形 JSON-RPC）仍是 JSON-RPC error。
+工具级失败（参数非法、没有播放器、播放器忙、账号问题）返回 `result.isError:true`，并在 `structuredContent` 给出机器可读的 `error`：`invalid_arguments`、`needs_player`、`busy`、`queue_boundary`、`unknown_method`、`disconnected`、`needs_login`、`no_candidates`、`no_likes`、`no_permission`、`already_present`、`not_found`、`playback_unavailable`、`risk_cooldown`、`account_confirmation_required`、`session_error`。协议层错误（未知工具、畸形 JSON-RPC）仍是 JSON-RPC error。宿主不应靠解析文案判断失败原因。
+
+`session_error` 专门表示**本机会话文件不可用**（缺失、被截断、DPAPI 解不开、超过 64 KiB 上限）；它不是网络失败，重试同一调用不会变好，需要用户重新登录。
+
+## 批量建队列（`music_recommend_queue`）
+
+“一次调用把 N 首歌排进队列并开始播放”，是系列请求的默认入口（取代逐首 `music_play` 或反复 `music_play_random`）。
+
+| 参数 | 语义 |
+| --- | --- |
+| `source=search` | 用 `intent` 搜真实曲库（分页，去重），适合歌手/风格/场景/心情 |
+| `source=playlists` | 从**账号自己与收藏的歌单**里取曲目；`intent` 被忽略（歌单没有关键词排序）；按 `seed` 随机起始歌单，最多读 4 个歌单，凑够 `count` 立即停止 |
+| `source=liked` | 从红心歌曲里取；`intent` 被忽略 |
+| `source=auto`（默认） | 先按 `intent` 搜索；**只有搜索完全为空**才回落到歌单 |
+
+- `count` 默认 **30**，范围 1..1000。整次调用只做**一次** `queue_edit(op=replace)`，不会逐首提交，也不会按歌曲数量放大请求数。
+- 返回 `{requestedCount, queuedCount, availableCount, source, searchIntent, changed, playback}`：`source` 是**实际生效**的来源（例如 `search+playlists`），`queuedCount < requestedCount` 时必须如实告知用户，不得圆成“已经放满”。
+- 失败码：`no_candidates`（该来源确实取不到可播放曲目）、`no_likes`（该账号没有红心）、`needs_login`、`needs_player`、`risk_cooldown`。
+- `auto` **刻意不做“补足”**：搜索只返回 3 首而用户要 30 首时，不会拿歌单曲目悄悄填满——那会改变用户要的东西。不足就报不足。
+
+## 红心歌曲（读与写）
+
+- `music_list_likes`：只读分页（`limit ≤ 50`、`offset ≤ 5000`），返回 `{total, offset, limit, items[]}`；`items` 每行与搜索/队列投影同构（`id/name/artist/album/durationSeconds`）。
+- `music_get_like`：只读单曲判定，返回 `{songId, liked, likedTotal}`。红心集合是**网络态**（不随 `session.bin` 持久化），所以冷启动第一次调用会先刷新一次账号状态再判定。
+- `music_set_like`：写，目标状态语义（`liked:true/false`），可重放；不做 toggle。
+- 未登录时两个读工具都给 `needs_login` 而不是“没有红心歌”，这两种情况对用户是不同的。
 
 ## 队列与播放模式（M8）
 
@@ -47,11 +76,11 @@
 | `remove` | `index`（必填，0 基） | 删除一行；当前行在被删行之后会前移一位，删到队尾则回退到新的最后一行。 |
 | `move` | `from`、`to`（必填，0 基） | 把一行移动到新位置；正在播放的行跟着自己的**内容**走，而不是留在旧下标。 |
 | `clear` | 无 | 清空整个队列并停止。 |
-| `replace` | `id` 或 `ids`（二选一，最多 100） | **换成这一组**：整队被替换成给定歌曲并从**第一首**开始播放。系列请求（歌手/风格/场景/心情）一次取回 5..20 首后用它建立队列，避免“只播一首”。 |
+| `replace` | `id` 或 `ids`（二选一，最多 1000） | **换成这一组**：整队被替换成给定歌曲并从**第一首**开始播放。系列请求（歌手/风格/场景/心情）一次取回 5..20 首后用它建立队列，避免“只播一首”。 |
 | `add_next` | `id` 或 `ids`（二选一） | “下一首插播”：把歌曲插到当前曲目之后，**保留**原有队列。 |
 | `append` | `id` 或 `ids`（二选一） | 追加到队尾，**保留**原有队列。 |
 
-- `ids` 上限：`replace` 为 100，`add_next`/`append` 为 50；`id` 与 `ids` 同时出现 → `invalid_arguments`。
+- `ids` 上限：`replace` 为 **1000**（与播放器的整队上限一致），`add_next`/`append` 为 50；schema 的 `maxItems` 与执行层校验一致；`id` 与 `ids` 同时出现 → `invalid_arguments`。
 - 返回新的队列投影：`{op, changed, total, index, mode, repeat, items[]}`；`replace`/`add_next`/`append` 额外返回 `requestedIds` 与 `metadataResolved`（`false` 表示只拿到 id、歌名等元数据缺失，播放器会经既有刷新流程补全，**不会编造歌名**）。
 - **已知行为**：`music_play(kind=song)` 入队的当前行元数据（歌名/歌手/专辑/时长）**可能延迟到详情刷新**才出现；`replace`/`add_next`/`append` 由适配器随 `tracks:[{id,name,artist,album,duration}]` 一并送入，通常立即带元数据。两种情况下 id 都是真实的，模型不得据空字段编造曲目信息。
 - 越界索引（`index >= total`）→ `invalid_arguments`，且**不产生部分写入**；`play_index` 指向当前行是幂等 no-op。未知 `op`、缺少必填参数、类型错误都在接触播放器之前拒绝。
@@ -141,7 +170,7 @@
 - 当前兼容协商版本：2025-11-25、2025-06-18、2025-03-26、2024-11-05。
 - 单条输入最大 64 KiB，输出有限，不发送完整媒体内容。
 - 协议错误用 JSON-RPC error；工具执行失败用 `result.isError:true`。
-- 没有 TUI 时，只读工具（search/open_collection/get_status/list_playlists）照常可用，播放类工具、`music_queue_list` 与**全部写工具**（含 `music_queue_edit`）返回 `needs_player`；`playerSessionAttached` 必须为 false。写工具先探活播放器，绝不回退到适配器本地网络；未知结果不重试，`operationId` 只用于宿主自身去重。
+- 没有 TUI 时，只读工具（search/open_collection/get_lyrics/get_status/list_playlists/list_likes/get_like/recommend）照常可用，播放类工具、`music_queue_list` 与**全部写工具**（含 `music_queue_edit`）返回 `needs_player`；`playerSessionAttached` 必须为 false。写工具先探活播放器，绝不回退到适配器本地网络；未知结果不重试，`operationId` 只用于宿主自身去重。
 
 ## 外部 Agent 配置示例
 

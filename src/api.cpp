@@ -264,8 +264,14 @@ namespace mora {
             throw std::runtime_error("播放密钥缺少字段");
     }
     void Api::account() {
-        if (!loggedIn())
+        if (!loggedIn()) {
+            // No cookie means no account. Clearing the stale identity keeps a dead session from
+            // being presented as a signed-in user whose very next request would fail with 301.
+            uid = 0;
+            nickname = L"未登录";
+            likes.clear();
             return;
+        }
         auto j = call("/api/w/nuser/account/get", Json::object(), true);
         if (!j.contains("profile") || j["profile"].is_null()) {
             uid = 0;
@@ -391,11 +397,16 @@ namespace mora {
         if (!loggedIn() && (!cookies.contains("MUSIC_A") || cookies["MUSIC_A"] == ""))
             call("/api/register/anonimous", Json{{"username", anonymousUsername(device)}}, false,
                  false, true);
-        if (track.name.empty()) {
+        if (track.name.empty() || track.cover.empty()) {
             auto d = details({track.id});
-            if (d.empty())
+            if (d.empty() && track.name.empty())
                 throw ApiError(404, "歌曲元数据不可用");
-            track = d.front();
+            if (!d.empty()) {
+                if (track.name.empty())
+                    track = d.front();
+                else if (track.cover.empty())
+                    track.cover = d.front().cover;
+            }
         }
         auto j = call("/api/song/enhance/player/url/v1",
                       Json{{"ids", "[" + std::to_string(track.id) + "]"},
@@ -417,11 +428,19 @@ namespace mora {
                 auto cover = track.cover;
                 if (cover.starts_with("http://"))
                     cover = "https://" + cover.substr(7);
-                cover += (cover.find('?') == std::string::npos ? "?" : "&");
-                cover += "param=96y96";
-                auto r = request(unutf8(cover), {}, {}, 128 * 1024, false);
-                if (r.status == 200)
-                    p.cover = decodeCover(bytes(r.body));
+                auto sized = cover + (cover.find('?') == std::string::npos ? "?" : "&") +
+                             "param=96y96";
+                for (const auto& url : {sized, cover}) {
+                    try {
+                        auto r = request(unutf8(url), {}, {}, 512 * 1024, false);
+                        if (r.status == 200) {
+                            p.cover = decodeCover(bytes(r.body));
+                            if (!p.cover.pixels.empty())
+                                break;
+                        }
+                    } catch (const std::exception&) {
+                    }
+                }
             } catch (...) {
             }
         return p;

@@ -325,6 +325,10 @@ int main() {
     int invoked = 0;
     McpServer mcp([&](const std::string& name, const Json& args) {
         ++invoked;
+        // A damaged local session surfaces as a plain runtime_error; the host must still receive a
+        // structured code instead of prose.
+        if (name == "music_list_likes")
+            throw std::runtime_error("Session file too large");
         return Json{{"name", name}, {"args", args}};
     });
     auto init = mcp.handle(Json{{"jsonrpc", "2.0"},
@@ -347,6 +351,21 @@ int main() {
             expected.insert(tool["name"].get<std::string>());
         CHECK(names == expected);
         CHECK(names.contains("music_queue_list") && names.contains("music_queue_edit"));
+        // A tool's advertised effect must match what it does: music_open_collection only pages
+        // through metadata, so no description may tell the model that it starts playback.
+        for (auto& tool : musicToolDefinitions()) {
+            auto description = tool.value("description", std::string());
+            auto name = tool.value("name", std::string());
+            if (name == "music_open_collection") {
+                CHECK(tool["annotations"]["readOnlyHint"] == true);
+                CHECK(description.find("never starts playback") != std::string::npos);
+                continue;
+            }
+            if (description.find("music_open_collection") == std::string::npos)
+                continue;
+            CHECK(description.find("only lists") != std::string::npos ||
+                  description.find("never starts playback") != std::string::npos);
+        }
     }
     auto called = mcp.handle(
         Json{{"jsonrpc", "2.0"},
@@ -359,6 +378,13 @@ int main() {
                                    {"method", "tools/call"},
                                    {"params", Json{{"name", "music_not_a_tool"}}}});
     CHECK((*unknown)["error"]["code"] == -32602 && invoked == 1);
+    auto failedSession = mcp.handle(
+        Json{{"jsonrpc", "2.0"},
+             {"id", 5},
+             {"method", "tools/call"},
+             {"params", Json{{"name", "music_list_likes"}, {"arguments", Json::object()}}}});
+    CHECK((*failedSession)["result"]["isError"] == true);
+    CHECK((*failedSession)["result"]["structuredContent"]["error"] == "session_error");
     // M4-A: tool layer requires the attached session for playback control.
     {
         MusicService service;
@@ -394,6 +420,219 @@ int main() {
         auto status = service.invoke("music_get_status", Json::object());
         CHECK(status["playerSessionAttached"] == true);
         CHECK(status["pending"] == Json::array({"agent_settings_form"}));
+        // Identity is reported read-only so the model can tell whether "my playlists" exist.
+        CHECK(status["account"].is_object() && status["account"]["signedIn"].is_boolean() &&
+              status["account"]["nickname"].is_string());
+        // Quality is a real listening operation, not a terminal-only setting.
+        auto quality = service.invoke(
+            "music_control", Json{{"action", "quality"}, {"level", "lossless"}});
+        CHECK(quality["method"] == "control" && quality["params"]["action"] == "quality" &&
+              quality["params"]["level"] == "lossless");
+        bool badQuality = false;
+        try {
+            service.invoke("music_control", Json{{"action", "quality"}, {"level", "ultra"}});
+        } catch (const ToolError& e) {
+            badQuality = e.code == "invalid_arguments";
+        }
+        CHECK(badQuality);
+        bool missingLevel = false;
+        try {
+            service.invoke("music_control", Json{{"action", "quality"}});
+        } catch (const ToolError& e) {
+            missingLevel = e.code == "invalid_arguments";
+        }
+        CHECK(missingLevel);
+        // A whole series can be replaced in one call up to the player's own 1000-row limit; the
+        // append family keeps its smaller 50-row bound so one call can never become a storm.
+        Json thousand = Json::array();
+        for (int i = 1; i <= 1000; ++i)
+            thousand.push_back(i);
+        thousand.push_back(1001);
+        bool tooMany = false;
+        try {
+            service.invoke("music_queue_edit", Json{{"op", "replace"}, {"ids", thousand}});
+        } catch (const ToolError& e) {
+            tooMany = e.code == "invalid_arguments";
+        }
+        CHECK(tooMany);
+        Json fiftyOne = Json::array();
+        for (int i = 1; i <= 51; ++i)
+            fiftyOne.push_back(i);
+        bool appendTooMany = false;
+        try {
+            service.invoke("music_queue_edit", Json{{"op", "append"}, {"ids", fiftyOne}});
+        } catch (const ToolError& e) {
+            appendTooMany = e.code == "invalid_arguments";
+        }
+        CHECK(appendTooMany);
+        int searches = 0, replacements = 0;
+        MusicService series;
+        series.attach([&](const std::string& method, const Json& params) {
+            if (method == "status")
+                return BridgeReply(true, "", "", Json::object());
+            if (method == "search") {
+                ++searches;
+                int offset = params.value("offset", 0);
+                Json items = Json::array();
+                for (int i = offset; i < std::min(offset + 30, 1000); ++i)
+                    items.push_back(Json{{"id", i + 1}});
+                return BridgeReply(true, "", "", Json{{"total", 1000}, {"items", items}});
+            }
+            CHECK(method == "queue_edit");
+            ++replacements;
+            CHECK(params["op"] == "replace");
+            return BridgeReply(true, "", "", Json{{"changed", true}});
+        });
+        for (int count : {10, 100, 1000}) {
+            searches = replacements = 0;
+            auto queued = series.invoke("music_recommend_queue",
+                                        Json{{"intent", "测试风格"}, {"count", count},
+                                             {"seed", 7}});
+            CHECK(queued["requestedCount"] == count && queued["queuedCount"] == count);
+            CHECK(replacements == 1 && searches >= 1);
+        }
+        CHECK(personaSearchSeed(resolvePersona("devil")).find(L"日语流行") !=
+              std::wstring::npos);
+        CHECK(usePersonaSearchSeed(L"随机播放十首歌"));
+        CHECK(usePersonaSearchSeed(L"按你的品味，随机播放二十首歌"));
+        CHECK(!usePersonaSearchSeed(L"随机播放十首周杰伦的歌"));
+        int broadened = 0;
+        MusicService broadSearch;
+        broadSearch.attach([&](const std::string& method, const Json& params) {
+            if (method == "status")
+                return BridgeReply(true, "", "", Json::object());
+            if (method == "search") {
+                auto query = params.value("query", std::string());
+                if (query == "日语流行") {
+                    ++broadened;
+                    return BridgeReply(true, "", "", Json{{"total", 20},
+                        {"items", Json::array({Json{{"id", 1}}, Json{{"id", 2}}})}});
+                }
+                return BridgeReply(true, "", "", Json{{"total", 0},
+                                                      {"items", Json::array()}});
+            }
+            // The auto fallback asks the player for the user's playlists when search came up
+            // short; this stub has none, so the queue keeps exactly the two search hits.
+            if (method == "playlists")
+                return BridgeReply(true, "", "", Json{{"items", Json::array()}});
+            CHECK(method == "queue_edit" && params["ids"].size() == 2);
+            return BridgeReply(true, "", "", Json{{"changed", true}});
+        });
+        auto broadenedQueue = broadSearch.invoke(
+            "music_recommend_queue", Json{{"intent", "日语流行 动画 J-ROCK"},
+                                          {"count", 10}, {"seed", 7}});
+        CHECK(broadenedQueue["queuedCount"] == 2 && broadened >= 1);
+    }
+    // Multi-song queueing must be able to draw from the user's own playlists, not only from a
+    // keyword search: "从我账号歌单随机挑三十首" used to fail with zero candidates.
+    {
+        MusicService fromPlaylists;
+        std::vector<int64_t> queuedIds;
+        fromPlaylists.attach([&](const std::string& method, const Json& params) {
+            if (method == "status")
+                return BridgeReply(true, "", "", Json::object());
+            if (method == "playlists") {
+                CHECK(params["ownedOnly"] == false);
+                return BridgeReply(true, "", "",
+                                   Json{{"items", Json::array({Json{{"id", 11}},
+                                                               Json{{"id", 12}}})}});
+            }
+            if (method == "search")
+                return BridgeReply(true, "", "",
+                                   Json{{"total", 0}, {"items", Json::array()}});
+            if (method == "collection") {
+                CHECK(params["kind"] == "playlist");
+                auto base = params["id"].get<int64_t>() * 100;
+                Json items = Json::array();
+                for (int i = 0; i < 100; ++i)
+                    items.push_back(Json{{"id", base + i}});
+                return BridgeReply(true, "", "", Json{{"total", 100}, {"items", items}});
+            }
+            CHECK(method == "queue_edit" && params["op"] == "replace");
+            for (auto& id : params["ids"])
+                queuedIds.push_back(id.get<int64_t>());
+            return BridgeReply(true, "", "", Json{{"changed", true}});
+        });
+        auto queued = fromPlaylists.invoke(
+            "music_recommend_queue", Json{{"source", "playlists"}, {"count", 30}, {"seed", 3}});
+        CHECK(queued["queuedCount"] == 30 && queued["source"] == "playlists" &&
+              queuedIds.size() == 30);
+        for (auto id : queuedIds)
+            CHECK(id > 100); // every id came from a playlist collection, never from a search
+        queuedIds.clear();
+        // No count named: the documented default applies instead of an error.
+        auto defaulted =
+            fromPlaylists.invoke("music_recommend_queue", Json{{"source", "playlists"}});
+        CHECK(defaulted["requestedCount"] == 30 && queuedIds.size() == 30);
+        // auto searches first and only falls back to the playlists when the search found nothing,
+        // which is the case that used to answer "没找到" for a playlist request.
+        queuedIds.clear();
+        auto autoFallback = fromPlaylists.invoke(
+            "music_recommend_queue", Json{{"intent", "无结果关键词"}, {"count", 5}});
+        CHECK(autoFallback["queuedCount"] == 5 &&
+              autoFallback["source"] == "search+playlists" && queuedIds.size() == 5);
+    }
+    // Liked songs are a listening source too: they are account state, so a cold service refreshes
+    // them once and can then queue or page them.
+    {
+        auto previousDir = []() {
+            std::wstring buffer(1024, L'\0');
+            auto size = GetEnvironmentVariableW(L"MORA_DATA_DIR", buffer.data(), 1024);
+            return size > 0 ? std::wstring(buffer.data(), size) : std::wstring();
+        }();
+        auto temporary = std::filesystem::temp_directory_path() / "mora-likes-test";
+        std::filesystem::remove_all(temporary);
+        SetEnvironmentVariableW(L"MORA_DATA_DIR", temporary.wstring().c_str());
+        auto transport = [](std::wstring url, std::string, std::wstring, size_t,
+                            bool) -> Response {
+            Response response;
+            response.status = 200;
+            if (url.find(L"qrcode/unikey") != std::wstring::npos)
+                response.body = R"({"code":200,"unikey":"likes-key"})";
+            else if (url.find(L"client/login") != std::wstring::npos) {
+                response.body = R"({"code":803})";
+                response.cookies = {"MUSIC_U=fixture-secret; Path=/; HttpOnly; Secure"};
+            } else if (url.find(L"account/get") != std::wstring::npos)
+                response.body = R"({"code":200,"profile":{"userId":42,"nickname":"fixture-me"}})";
+            else if (url.find(L"like/get") != std::wstring::npos)
+                response.body = R"({"code":200,"ids":[101,102,103,104,105]})";
+            else
+                response.body = R"({"code":200})";
+            return response;
+        };
+        {
+            Api seed(temporary, transport);
+            seed.qrKey();
+            CHECK(seed.qrCheck("likes-key") == 803 && seed.likes.size() == 5);
+        }
+        MusicService fromLikes;
+        fromLikes.useTransport(transport);
+        std::vector<int64_t> queuedIds;
+        fromLikes.attach([&](const std::string& method, const Json& params) {
+            if (method == "status")
+                return BridgeReply(true, "", "", Json::object());
+            CHECK(method == "queue_edit");
+            for (auto& id : params["ids"])
+                queuedIds.push_back(id.get<int64_t>());
+            return BridgeReply(true, "", "", Json{{"changed", true}});
+        });
+        auto queued = fromLikes.invoke("music_recommend_queue",
+                                       Json{{"source", "liked"}, {"count", 3}, {"seed", 5}});
+        CHECK(queued["queuedCount"] == 3 && queued["source"] == "liked" && queuedIds.size() == 3);
+        for (auto id : queuedIds)
+            CHECK(id >= 101 && id <= 105);
+        auto page = fromLikes.invoke("music_list_likes", Json{{"limit", 2}, {"offset", 0}});
+        CHECK(page["total"] == 5 && page["items"].size() == 2);
+        auto tail = fromLikes.invoke("music_list_likes", Json{{"limit", 50}, {"offset", 4}});
+        CHECK(tail["items"].size() == 1);
+        // One read answers "is this song hearted", so the model never has to page the whole list.
+        auto hearted = fromLikes.invoke("music_get_like", Json{{"songId", 103}});
+        CHECK(hearted["liked"] == true && hearted["likedTotal"] == 5);
+        auto stranger = fromLikes.invoke("music_get_like", Json{{"songId", 999}});
+        CHECK(stranger["liked"] == false);
+        std::filesystem::remove_all(temporary);
+        SetEnvironmentVariableW(L"MORA_DATA_DIR", previousDir.empty() ? nullptr
+                                                                     : previousDir.c_str());
     }
     // M3: the model adapter shapes tools/messages and stays inside its budgets.
     {
@@ -455,11 +694,11 @@ int main() {
             },
             [&modelCalls](const AgentConfig&, const Json& messages, const Json& tools) {
                 ++modelCalls;
-                // Every music tool plus the terminal-only persona creator.
-                CHECK(tools.size() == musicToolDefinitions().size() + 1);
-                CHECK(tools.back()["function"]["name"] == "mora_create_persona");
-                CHECK(tools.back()["function"]["parameters"]["required"] ==
-                      Json::array({"id", "name", "voice", "taste"}));
+                // A search request receives read-only tools, not playback tools.
+                CHECK(!tools.empty());
+                for (const auto& tool : tools)
+                    CHECK(tool["function"]["name"] != "music_play" &&
+                          tool["function"]["name"] != "mora_create_persona");
                 CHECK(messages.size() >= 2 && messages[0]["role"] == "system" &&
                       messages[1]["role"] == "user");
                 if (modelCalls == 1)
@@ -548,6 +787,280 @@ int main() {
             });
         CHECK(withTool.ok && withTool.trace.size() == 1);
         CHECK(withTool.trace.dump().find("resultSummary") != std::string::npos);
+        AgentConfig shortBudget;
+        shortBudget.maxRounds = 1;
+        int finalCalls = 0;
+        auto playedAtLimit = runChatLoop(
+            shortBudget, "播放歌曲",
+            [](const std::string& name, const Json&) {
+                CHECK(name == "music_play");
+                return Json{{"accepted", true}};
+            },
+            [&finalCalls](const AgentConfig&, const Json& messages, const Json& tools) {
+                ++finalCalls;
+                if (!tools.empty())
+                    return Json{{"choices", Json::array({Json{{"message", Json{
+                        {"content", nullptr}, {"tool_calls", Json::array({Json{
+                            {"id", "play-1"}, {"type", "function"},
+                            {"function", Json{{"name", "music_play"}, {"arguments", "{}"}}}}})}}}}})}};
+                CHECK(messages.back()["role"] == "tool");
+                return Json{{"choices", Json::array({Json{{"message", Json{{"content", "已提交播放。"}}}}})}};
+            });
+        CHECK(playedAtLimit.ok && playedAtLimit.code.empty() &&
+              playedAtLimit.text == L"已提交播放。" && finalCalls == 2 &&
+              playedAtLimit.toolCalls == 1);
+        auto toolRequest = [](const std::string& id, const std::string& name) {
+            return Json{{"choices", Json::array({Json{{"message", Json{
+                {"content", nullptr}, {"tool_calls", Json::array({Json{
+                    {"id", id}, {"type", "function"},
+                    {"function", Json{{"name", name}, {"arguments", "{}"}}}}})}}}}})}};
+        };
+        for (bool contextLimit : {false, true}) {
+            AgentConfig limit;
+            limit.maxRounds = 3;
+            limit.maxToolCalls = contextLimit ? 8 : 1;
+            limit.maxContextMessages = contextLimit ? 4 : 64;
+            int writes = 0, requests = 0;
+            auto recovered = runChatLoop(
+                limit, "播放一首歌",
+                [&writes](const std::string&, const Json&) {
+                    ++writes;
+                    return Json{{"accepted", true}};
+                },
+                [&](const AgentConfig&, const Json& messages, const Json& tools) {
+                    ++requests;
+                    if (requests == 1)
+                        return toolRequest("first", "music_queue_edit");
+                    CHECK(messages.back()["role"] == "tool");
+                    if (!tools.empty())
+                        return toolRequest("extra", "music_queue_edit");
+                    return Json{{"choices", Json::array({Json{{"message", Json{{"content", "已换好十首。"}}}}})}};
+                });
+            CHECK(recovered.ok && recovered.code.empty() &&
+                  recovered.text == L"已换好十首。" && writes == 1 && requests == 2);
+        }
+        int markupRequests = 0;
+        auto markup = runChatLoop(
+            AgentConfig{}, "换一首歌",
+            [](const std::string&, const Json&) {
+                return Json{{"changed", true}};
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                ++markupRequests;
+                if (markupRequests == 1)
+                    return Json{{"choices", Json::array({Json{{"message", Json{
+                        {"content", nullptr}, {"tool_calls", Json::array({Json{
+                            {"id", "queue"}, {"type", "function"},
+                            {"function", Json{{"name", "music_queue_edit"},
+                                               {"arguments", "{\"op\":\"replace\",\"ids\":[1,2,3]}"}}}}})}}}}})}};
+                CHECK(tools.empty() || markupRequests == 2);
+                return Json{{"choices", Json::array({Json{{"message", Json{
+                    {"content", "<|DSML|calls><|DSML|invoke name=\"music_play\">"}}}}})}};
+            });
+        CHECK(markup.ok && markupRequests == 2 &&
+              markup.text == L"已替换播放队列，共 3 首歌。");
+        int seriesModelCalls = 0, seriesToolCalls = 0;
+        auto seriesAnswer = runChatLoop(
+            AgentConfig{}, "按你的品味随机播放一千首歌曲",
+            [&](const std::string& name, const Json& args) {
+                ++seriesToolCalls;
+                CHECK(name == "music_recommend_queue" && args["count"] == 1000);
+                return Json{{"requestedCount", 1000}, {"queuedCount", 987},
+                            {"changed", true}};
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                ++seriesModelCalls;
+                if (!tools.empty()) {
+                    // The one-call queue tool, one batch queue edit for ids the model already has,
+                    // and single-shot read-only context: never a per-song playback loop.
+                    std::set<std::string> names;
+                    for (const auto& tool : tools)
+                        names.insert(tool["function"]["name"].get<std::string>());
+                    CHECK(names.contains("music_recommend_queue"));
+                    CHECK(names.contains("music_queue_edit"));
+                    CHECK(!names.contains("music_play") && !names.contains("music_play_random") &&
+                          !names.contains("music_search"));
+                    return Json{{"choices", Json::array({Json{{"message", Json{
+                        {"content", nullptr}, {"tool_calls", Json::array({Json{
+                            {"id", "series"}, {"type", "function"},
+                            {"function", Json{{"name", "music_recommend_queue"},
+                                               {"arguments", "{\"intent\":\"日语流行\",\"count\":1000}"}}}}})}}}}})}};
+                }
+                return Json{{"choices", Json::array({Json{{"message", Json{{"content", "已排入987首，其余没有找到。"}}}}})}};
+            });
+        CHECK(seriesAnswer.ok && seriesModelCalls == 2 && seriesToolCalls == 1 &&
+              seriesAnswer.text.find(L"987") != std::wstring::npos);
+        int chatToolCalls = 0, chatModelCalls = 0;
+        auto opinion = runChatLoop(
+            AgentConfig{}, "随便聊聊你对现在播放的歌的看法",
+            [&](const std::string&, const Json&) {
+                ++chatToolCalls;
+                return Json::object();
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                ++chatModelCalls;
+                CHECK(tools.empty());
+                return Json{{"choices", Json::array({Json{{"message", Json{{"content", "这首歌的节奏很有冲劲。"}}}}})}};
+            });
+        CHECK(opinion.ok && chatModelCalls == 1 && chatToolCalls == 0);
+        int statusOnlyCalls = 0;
+        auto currentSongQuestion = runChatLoop(
+            AgentConfig{}, "现在播放的是什么歌？",
+            [&](const std::string&, const Json&) {
+                ++statusOnlyCalls;
+                return Json::object();
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                for (const auto& tool : tools)
+                    CHECK(tool["function"]["name"] != "music_play" &&
+                          tool["function"]["name"] != "music_recommend_queue");
+                return Json{{"choices", Json::array({Json{{"message", Json{{"content", "我来看看当前曲目。"}}}}})}};
+            });
+        CHECK(currentSongQuestion.ok && statusOnlyCalls == 0);
+        int illegalCalls = 0;
+        auto illegalPlayback = runChatLoop(
+            AgentConfig{}, "聊聊这首歌",
+            [&](const std::string&, const Json&) {
+                ++illegalCalls;
+                return Json::object();
+            },
+            [&](const AgentConfig&, const Json&, const Json&) {
+                static int rounds = 0;
+                if (++rounds == 1)
+                    return toolRequest("unexpected", "music_play");
+                return Json{{"choices", Json::array({Json{{"message", Json{{"content", "我们聊聊它的旋律。"}}}}})}};
+            });
+        CHECK(illegalPlayback.ok && illegalCalls == 0);
+        int stubbornCalls = 0, stubbornWrites = 0;
+        auto stubborn = runChatLoop(
+            AgentConfig{}, "播放一首歌",
+            [&](const std::string&, const Json&) {
+                ++stubbornWrites;
+                return Json{{"accepted", true}};
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                ++stubbornCalls;
+                CHECK(stubbornCalls == 1 || tools.empty());
+                return toolRequest("again", "music_play");
+            });
+        CHECK(stubborn.ok && stubbornWrites == 1 && stubbornCalls == 2 &&
+              stubborn.text == L"已提交播放请求。");
+        int failedSeriesCalls = 0;
+        auto failedSeries = runChatLoop(
+            AgentConfig{}, "随机播放二十首歌",
+            [&](const std::string&, const Json&) -> Json {
+                ++failedSeriesCalls;
+                throw ToolError("no_candidates", "no songs available");
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                CHECK(!tools.empty());
+                return toolRequest("series-failed", "music_recommend_queue");
+            });
+        CHECK(failedSeries.ok && failedSeriesCalls == 1 &&
+              failedSeries.text.find(L"没找到") != std::wstring::npos);
+        // A recommendation the user wants to listen to is an operation even without the word
+        // "播放": this exact phrasing used to be classified as small talk and lost every queue tool.
+        int recommendCalls = 0, recommendToolCalls = 0;
+        auto recommended = runChatLoop(
+            AgentConfig{}, "推荐三十首歌我听听，并及时锐评",
+            [&](const std::string& name, const Json& args) {
+                ++recommendToolCalls;
+                CHECK(name == "music_recommend_queue" && args["count"] == 30);
+                return Json{{"requestedCount", 30}, {"queuedCount", 30}, {"changed", true}};
+            },
+            [&](const AgentConfig&, const Json&, const Json& tools) {
+                ++recommendCalls;
+                std::set<std::string> names;
+                for (const auto& tool : tools)
+                    names.insert(tool["function"]["name"].get<std::string>());
+                if (recommendCalls == 1) {
+                    CHECK(names.contains("music_recommend_queue"));
+                    CHECK(!names.contains("music_play") && !names.contains("music_play_random"));
+                    return Json{{"choices", Json::array({Json{{"message", Json{
+                        {"content", nullptr}, {"tool_calls", Json::array({Json{
+                            {"id", "queue-thirty"}, {"type", "function"},
+                            {"function", Json{{"name", "music_recommend_queue"},
+                                               {"arguments", "{\"intent\":\"日语流行\",\"count\":30}"}}}}})}}}}})}};
+                }
+                CHECK(names.empty());
+                return Json{{"choices", Json::array({Json{{"message", Json{
+                    {"content", "三十首都排好了，先听前几首。"}}}}})}};
+            });
+        CHECK(recommended.ok && recommendToolCalls == 1 && recommendCalls == 2 &&
+              recommended.text.find(L"三十首") != std::wstring::npos);
+        std::filesystem::remove_all(temporary);
+        SetEnvironmentVariableW(L"MORA_DATA_DIR", previousDir.empty() ? nullptr
+                                                                     : previousDir.c_str());
+    }
+    // M4-B: playlist ownership must be decided from a resolved account id. A fresh service used to
+    // compare the creator against a not-yet-loaded uid (0), so every playlist - including the
+    // user's own - was reported as somebody else's and lost its write actions.
+    {
+        auto previousDir = []() {
+            std::wstring buffer(1024, L'\0');
+            auto size = GetEnvironmentVariableW(L"MORA_DATA_DIR", buffer.data(), 1024);
+            return size > 0 ? std::wstring(buffer.data(), size) : std::wstring();
+        }();
+        auto temporary = std::filesystem::temp_directory_path() / "mora-owned-test";
+        std::filesystem::remove_all(temporary);
+        SetEnvironmentVariableW(L"MORA_DATA_DIR", temporary.wstring().c_str());
+        auto transport = [](std::wstring url, std::string, std::wstring, size_t,
+                            bool) -> Response {
+            Response response;
+            response.status = 200;
+            if (url.find(L"qrcode/unikey") != std::wstring::npos)
+                response.body = R"({"code":200,"unikey":"owned-key"})";
+            else if (url.find(L"client/login") != std::wstring::npos) {
+                response.body = R"({"code":803})";
+                response.cookies = {"MUSIC_U=fixture-secret; Path=/; HttpOnly; Secure"};
+            } else if (url.find(L"account/get") != std::wstring::npos)
+                response.body =
+                    R"({"code":200,"profile":{"userId":42,"nickname":"fixture-me"}})";
+            else if (url.find(L"like/get") != std::wstring::npos)
+                response.body = R"({"code":200,"ids":[123]})";
+            else if (url.find(L"user/playlist") != std::wstring::npos)
+                response.body = R"({"code":200,"playlist":[{"id":11,"name":"mine","creator":{"userId":42,"nickname":"me"}},{"id":12,"name":"other","creator":{"userId":99,"nickname":"other"}}]})";
+            else
+                response.body = R"({"code":200})";
+            return response;
+        };
+        // Seed a real saved session through the public login path, then drop the cached account id:
+        // a cold start can hold a valid cookie before account() has ever run, and that is exactly
+        // the state in which the ordering of "list first, then read uid" matters.
+        {
+            Api seed(temporary, transport);
+            seed.qrKey();
+            CHECK(seed.qrCheck("owned-key") == 803 && seed.loggedIn() && seed.uid == 42);
+            std::ifstream in(temporary / L"session.bin", std::ios::binary);
+            Bytes blob((std::istreambuf_iterator<char>(in)), {});
+            auto stored = Json::parse(str(unprotect(blob)));
+            CHECK(stored.is_object() && stored.contains("cookies"));
+            stored.erase("uid");
+            stored.erase("nickname");
+            auto clear = bytes(stored.dump());
+            auto encrypted = protect(clear);
+            std::ofstream out(temporary / L"session.bin", std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(encrypted.data()),
+                      static_cast<std::streamsize>(encrypted.size()));
+        }
+        MusicService owned;
+        owned.useTransport(transport);
+        CHECK(owned.uid() == 0); // nothing cached yet: the cookie alone carries no account id
+        auto mine = owned.invoke("music_list_playlists",
+                                 Json{{"ownedOnly", true}, {"limit", 50}});
+        CHECK(mine["total"] == 1 && mine["items"].size() == 1);
+        CHECK(mine["items"][0]["id"] == 11 && mine["items"][0]["owner"] == true &&
+              mine["items"][0]["canWrite"] == true);
+        CHECK(owned.uid() == 42 && owned.nickname() == L"fixture-me");
+        auto all = owned.invoke("music_list_playlists", Json{{"ownedOnly", false}});
+        CHECK(all["total"] == 2 && all["items"].size() == 2);
+        CHECK(all["items"][0]["owner"] == true && all["items"][0]["canWrite"] == true);
+        CHECK(all["items"][1]["id"] == 12 && all["items"][1]["owner"] == false &&
+              all["items"][1]["canWrite"] == false);
+        // The identity survives releaseBackend(): a thin adapter drops the backend between calls
+        // and must still know who it is talking to.
+        owned.releaseBackend();
+        CHECK(owned.uid() == 42 && owned.nickname() == L"fixture-me");
         std::filesystem::remove_all(temporary);
         SetEnvironmentVariableW(L"MORA_DATA_DIR", previousDir.empty() ? nullptr
                                                                      : previousDir.c_str());
@@ -1092,6 +1605,33 @@ int main() {
         restored.logout();
         CHECK(!restored.loggedIn());
         CHECK(!std::filesystem::exists(fixtureDir / L"session.bin"));
+    }
+    {
+        // A session file that still carries an identity but has lost its cookie must not be
+        // presented as a signed-in account: account() clears the stale fields without a request.
+        auto staleDir = fixtureDir / L"stale";
+        std::filesystem::create_directories(staleDir);
+        Json stale = {{"device", "stale-device"},
+                      {"cookies", Json::object()},
+                      {"uid", 42},
+                      {"nickname", "stale-user"}};
+        auto clear = bytes(stale.dump());
+        auto encrypted = protect(clear);
+        {
+            std::ofstream out(staleDir / L"session.bin", std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(encrypted.data()),
+                      static_cast<std::streamsize>(encrypted.size()));
+        }
+        int staleRequests = 0;
+        Api orphaned(staleDir, [&](std::wstring, std::string, std::wstring, size_t, bool) {
+            ++staleRequests;
+            return Response{.body = R"({"code":200})", .status = 200};
+        });
+        CHECK(!orphaned.loggedIn() && orphaned.uid == 42 && orphaned.nickname == L"stale-user");
+        orphaned.account();
+        CHECK(orphaned.uid == 0 && orphaned.nickname == L"未登录" && orphaned.likes.empty());
+        CHECK(staleRequests == 0);
+        std::filesystem::remove_all(staleDir);
     }
     int riskCalls = 0;
     Api risk(fixtureDir, [&](std::wstring, std::string, std::wstring, size_t, bool) {

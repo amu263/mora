@@ -307,8 +307,11 @@ int main() {
                 result["playlists"] = (int64_t)playlists.size();
                 Json names = Json::array();
                 for (size_t i = 0; i < playlists.size() && i < 10; ++i)
-                    names.push_back(Json{{"id", playlists[i].id}, {"name", utf8(playlists[i].name)},
-                                         {"owner", (bool)playlists[i].owner}});
+                    names.push_back(Json{{"id", playlists[i].id},
+                                         {"name", utf8(playlists[i].name)},
+                                         // Ownership is this account's id, not "some creator exists":
+                                         // the sample also contains playlists other people own.
+                                         {"owner", playlists[i].owner == api.uid}});
                 result["playlistSample"] = names;
             } catch (const ApiError& e) {
                 result["playlistsError"] = e.what();

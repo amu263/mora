@@ -220,11 +220,16 @@ namespace mora {
                    L"1) 模糊也要行动：能从上下文或常见口味推断就直接搜索/推荐并播放；只有真正"
                    L"无法判断才问，且最多问一次；播放前不要反复确认。\n"
                    L"2) 意图→操作：单曲→music_search 后 music_play(kind=song,id)；专辑或歌单→"
-                   L"music_play 或 music_open_collection(kind=album|playlist,id)，替换队列并播放"
-                   L"整个集合；歌手/风格/场景/心情（无明确专辑）→music_search(query=关键词, "
-                   L"limit=10..30) 取一组 id 后 music_queue_edit(op=replace, ids=[…]) 一次建立"
-                   L"多首队列并从第一首播放，禁止只播一首；不确定或随机→music_recommend 后 "
-                   L"music_play_random。\n"
+                   L"music_play(kind=album|playlist,id)，替换队列并播放整个集合（"
+                   L"music_open_collection 只列曲目、不播放）；歌手/风格/场景/心情（无明确专辑）→"
+                   L"music_recommend_queue(intent=取向,count=首数) 一次建队列并开始播放；"
+                   L"“从我的歌单/收藏挑 N 首”→music_recommend_queue(source=playlists,"
+                   L"count=N)（intent 可留空）；“我喜欢的歌/红心”→music_recommend_queue("
+                   L"source=liked,count=N)，只想看看有哪些就 music_list_likes；也可以先用 "
+                   L"music_open_collection 或 music_list_likes 读出 id，再一次 "
+                   L"music_queue_edit(op=replace, ids=[…]) 入队，禁止逐首播放；不确定或随机→"
+                   L"music_recommend 后 music_play_random；换音质→music_control(action=quality, "
+                   L"level=standard|higher|exhigh|lossless|hires)。\n"
                    L"3) 替换 vs 追加：“换成/只听/播放这张专辑”=替换；“再加上/再来点/接着放/排在"
                    L"后面”=append 或 add_next（插到当前曲之后），不得替换当前队列。\n"
                    L"4) 系列请求取回 5..20 首（有界不超过 50）；工具返回 accepted 后必须用 "
@@ -787,6 +792,13 @@ namespace mora {
                             const std::wstring& systemPrompt,
                             const std::vector<AgentMessage>& history) {
         ChatOutcome outcome;
+        auto toolMarkup = [](const std::wstring& value) {
+            return value.find(L"DSML") != std::wstring::npos &&
+                   (value.find(L"invoke") != std::wstring::npos ||
+                    value.find(L"calls") != std::wstring::npos);
+        };
+        std::wstring completedAction;
+        std::wstring requiredCountInAnswer;
         if (userText.empty()) {
             outcome.code = "invalid_arguments";
             outcome.error = "empty chat request";
@@ -802,7 +814,73 @@ namespace mora {
             outcome.error = "no tool executor";
             return outcome;
         }
-        Json tools = agentToolsFrom(musicToolDefinitions());
+        auto request = unutf8(userText);
+        auto containsAny = [&](std::initializer_list<std::wstring_view> words) {
+            for (auto word : words)
+                if (request.find(word) != std::wstring::npos)
+                    return true;
+            return false;
+        };
+        bool currentSongReference = containsAny({L"正在播放", L"现在播放", L"当前播放",
+                                                 L"播放的歌", L"播放的是", L"播放什么"});
+        bool explicitCommand = containsAny({L"请播放", L"帮我播放", L"给我播放",
+                                            L"随机播放", L"换成", L"换一首", L"换歌"});
+        // Asking what is playing is a question about the player, not an instruction to change it.
+        bool readOnlyQuestion = currentSongReference && !explicitCommand;
+        // A listening, recommendation or queue verb means the user wants music. "推荐三十首歌我听听"
+        // carries no 播放/听歌 wording, and treating it as small talk is what left the model without
+        // any queue tool at all.
+        bool musicVerb = containsAny({L"播放", L"放歌", L"放一", L"放几", L"听听", L"试听",
+                                      L"听歌", L"听一", L"听一下", L"推荐", L"来点", L"来首",
+                                      L"来几首", L"整点", L"换", L"随机"});
+        // An opinion about the track that is already playing stays small talk: the prompt itself
+        // carries the live track and the current line, so the model needs no tool to comment. A
+        // greeting only stays small talk while nothing in it asks for music either, so a mixed
+        // request ("推荐三十首并锐评" or "谢谢，顺便放首歌") is still an operation.
+        bool opinion = containsAny({L"聊聊", L"看法", L"觉得", L"评价", L"感想", L"怎么想"});
+        bool aboutCurrent = currentSongReference || containsAny({L"这首歌", L"这首", L"这歌"});
+        bool discussion = !explicitCommand &&
+                          ((opinion && aboutCurrent) ||
+                           (containsAny({L"你好", L"谢谢"}) && !musicVerb));
+        bool hasCount = request.find(L"首") != std::wstring::npos &&
+            request.find_first_of(L"0123456789一二三四五六七八九十百千万两几") !=
+                std::wstring::npos;
+        bool multiSongPlayback = !discussion && !readOnlyQuestion && musicVerb && hasCount &&
+            !containsAny({L"一首", L"1首"}) &&
+            !containsAny({L"追加", L"加到", L"排在后面", L"接着放"});
+        bool writeRequest = !discussion && !readOnlyQuestion &&
+            (musicVerb || containsAny({L"暂停", L"继续播放", L"下一首", L"上一首",
+                                       L"跳过", L"音量", L"收藏", L"加入", L"追加",
+                                       L"添加", L"创建人设", L"设定人设", L"删除"}));
+        Json definitions = musicToolDefinitions();
+        Json permitted = Json::array();
+        std::set<std::string> readOnlyTools;
+        // Single-shot read-only tools stay available next to the queue tool, so a mixed request can
+        // still look at the live player, but search/list are held back: one "verify every song"
+        // loop would exhaust the tool budget that the one-call queue tool exists to protect.
+        const std::set<std::string> multiSongReadOnly{
+            "music_get_status", "music_now_playing", "music_queue_list", "music_get_lyrics",
+            "music_recommend", "music_list_likes"};
+        for (const auto& definition : definitions) {
+            auto name = definition.value("name", std::string());
+            bool readOnly = definition.value("annotations", Json::object())
+                                .value("readOnlyHint", false);
+            if (readOnly)
+                readOnlyTools.insert(name);
+            if (discussion)
+                continue;
+            if (multiSongPlayback) {
+                // One batch queue tool, or one queue edit built from ids the model already read -
+                // that is how "从我的歌单挑 30 首" works after listing a playlist. Only the one-song
+                // tools stay blocked, so a series request can never become a per-song tool loop.
+                if (name != "music_recommend_queue" && name != "music_queue_edit" &&
+                    !(readOnly && multiSongReadOnly.contains(name)))
+                    continue;
+            } else if (!writeRequest && !readOnly)
+                continue;
+            permitted.push_back(definition);
+        }
+        Json tools = agentToolsFrom(permitted);
         // Persona creation is internal to the terminal player, so it is offered to the built-in
         // model only and never advertised through the external MCP tool list.
         Json fields;
@@ -829,7 +907,11 @@ namespace mora {
         Json personaTool;
         personaTool["type"] = "function";
         personaTool["function"] = function;
-        tools.push_back(personaTool);
+        if (writeRequest && !multiSongPlayback)
+            tools.push_back(personaTool);
+        std::set<std::string> allowedTools;
+        for (const auto& tool : tools)
+            allowedTools.insert(tool["function"]["name"].get<std::string>());
         const auto& send = transport ? transport
                                      : ModelTransport([](const AgentConfig& cfg, const Json& m,
                                                          const Json& t) {
@@ -839,6 +921,9 @@ namespace mora {
         // the caller hands over more history than the message budget allows; a leading compaction
         // checkpoint stays, because it is the only trace of the turns it replaced.
         std::vector<AgentMessage> memory = history;
+        memory.erase(std::remove_if(memory.begin(), memory.end(), [&](const AgentMessage& item) {
+                         return item.role == "assistant" && toolMarkup(unutf8(item.content));
+                     }), memory.end());
         size_t checkpoint = 0;
         while (checkpoint < memory.size() && memory[checkpoint].role == "system")
             ++checkpoint;
@@ -850,6 +935,21 @@ namespace mora {
         outcome.contextLimitTokens = plan.limitTokens;
         outcome.promptTokens = plan.promptTokens;
         Json messages = plan.messages;
+        const std::string routingHint =
+            "\nConversation and opinions about the current song are not playback commands. Never "
+            "start music unless the user explicitly requests an operation. For a request to replace "
+            "the queue with N songs, use music_recommend_queue in one call: an intent based on the "
+            "active persona's taste for a style or mood request, source=playlists for 'from my "
+            "playlists', source=liked for 'my liked songs' (music_list_likes only lists them). "
+            "Counts of 10, 30, 100 or 1000 are supported and count defaults to 30. If the user "
+            "already has ids (for example after music_open_collection or music_list_likes), one "
+            "music_queue_edit(op=replace, ids=[...]) is the correct batch write - never queue songs "
+            "one at a time with music_play. Report queuedCount versus requestedCount honestly. For "
+            "requests to add songs without replacing the queue, use append instead.";
+        if (messages.size() > 0 && messages[0].is_object() &&
+            messages[0].value("role", std::string()) == "system" &&
+            messages[0].contains("content") && messages[0]["content"].is_string())
+            messages[0]["content"] = messages[0]["content"].get<std::string>() + routingHint;
         // Over the window: fold the oldest turns into one summary before the request goes out. A
         // failed summary is labelled in band and the folded turns are still there in bounded form,
         // so history is never silently dropped while the turn still reports success.
@@ -872,6 +972,22 @@ namespace mora {
                          {"resultBytes", static_cast<int64_t>(summary.text.size())},
                          {"resultSummary", summarize(summary.text, 200)}});
         }
+        auto finishWithoutTools = [&]() {
+            try {
+                Json finalMessages = messages;
+                finalMessages[0]["content"] =
+                    finalMessages[0]["content"].get<std::string>() +
+                    "\nTool use has ended. Answer the user's request briefly using only completed tool results. State clearly what was completed and what was not; do not claim accepted playback is already audible.";
+                auto reply = parseAssistant(send(config, finalMessages, Json::array()));
+                if (reply.calls.empty() && !reply.text.empty() && !toolMarkup(reply.text)) {
+                    outcome.text = reply.text;
+                    outcome.ok = true;
+                    return true;
+                }
+            } catch (const std::exception&) {
+            }
+            return false;
+        };
         for (int round = 0; round < config.maxRounds; ++round) {
             // The accounting describes the request this round actually sends.
             if (tokenEstimateSafe(messages))
@@ -890,8 +1006,53 @@ namespace mora {
             }
             auto reply = parseAssistant(response);
             if (reply.calls.empty()) {
+                if (toolMarkup(reply.text)) {
+                    if (finishWithoutTools())
+                        return outcome;
+                    if (!completedAction.empty()) {
+                        outcome.text = completedAction;
+                        outcome.ok = true;
+                        return outcome;
+                    }
+                    outcome.code = "bad_response";
+                    outcome.error = "model returned tool markup instead of a user-facing answer";
+                    return outcome;
+                }
                 outcome.text = reply.text;
                 outcome.ok = true;
+                return outcome;
+            }
+            bool unadvertised = std::any_of(reply.calls.begin(), reply.calls.end(),
+                                            [&](const ToolCall& call) {
+                                                return !allowedTools.contains(call.name);
+                                            });
+            if (unadvertised) {
+                if (finishWithoutTools())
+                    return outcome;
+                if (!completedAction.empty()) {
+                    outcome.text = completedAction;
+                    outcome.ok = true;
+                    return outcome;
+                }
+                outcome.code = "bad_response";
+                outcome.error = "model requested a tool not allowed for this request";
+                return outcome;
+            }
+            // Keep the assistant tool turn paired with every result. If it cannot fit, ask for a
+            // final answer using only results already present in the conversation.
+            if (outcome.toolCalls + static_cast<int>(reply.calls.size()) > config.maxToolCalls) {
+                if (finishWithoutTools())
+                    return outcome;
+                outcome.code = "tool_budget";
+                outcome.error = "tool call budget exhausted";
+                return outcome;
+            }
+            if (messages.size() + 1 + reply.calls.size() >
+                static_cast<size_t>(config.maxContextMessages)) {
+                if (finishWithoutTools())
+                    return outcome;
+                outcome.code = "context_budget";
+                outcome.error = "context message budget exhausted";
                 return outcome;
             }
             auto choices = response.value("choices", Json::array());
@@ -903,19 +1064,48 @@ namespace mora {
             if (!assistant.contains("content") || assistant["content"].is_null())
                 assistant["content"] = "";
             messages.push_back(assistant);
+            bool completedWrite = false;
             for (auto& call : reply.calls) {
-                if (++outcome.toolCalls > config.maxToolCalls) {
-                    outcome.code = "tool_budget";
-                    outcome.error = "tool call budget exhausted";
-                    return outcome;
-                }
+                ++outcome.toolCalls;
                 Json result;
-                try {
-                    result = execute(call.name, call.arguments);
-                } catch (const ToolError& error) {
-                    result = Json{{"error", error.code}, {"message", error.what()}};
-                } catch (const std::exception& error) {
-                    result = Json{{"error", "tool_failed"}, {"message", error.what()}};
+                if (completedWrite) {
+                    result = Json{{"error", "skipped_after_action"},
+                                  {"message", "one successful write per turn"}};
+                } else {
+                    try {
+                        result = execute(call.name, call.arguments);
+                    } catch (const ToolError& error) {
+                        result = Json{{"error", error.code}, {"message", error.what()}};
+                    } catch (const std::exception& error) {
+                        result = Json{{"error", "tool_failed"}, {"message", error.what()}};
+                    }
+                }
+                if (result.is_object() && !result.contains("error") &&
+                    result.value("changed", true)) {
+                    if (!readOnlyTools.contains(call.name))
+                        completedWrite = true;
+                    if (call.name == "music_recommend_queue") {
+                        auto queued = result.value("queuedCount", size_t(0));
+                        auto requested = result.value("requestedCount", 0);
+                        completedAction = L"已替换播放队列，共 " +
+                                          std::to_wstring(queued) + L" 首歌";
+                        if (queued < static_cast<size_t>(requested))
+                            completedAction += L"（请求 " + std::to_wstring(requested) + L" 首）";
+                        if (queued < static_cast<size_t>(requested))
+                            requiredCountInAnswer = std::to_wstring(queued);
+                        completedAction += L"。";
+                    } else if (call.name == "music_queue_edit" && call.arguments.is_object() &&
+                        call.arguments.value("op", std::string()) == "replace") {
+                        auto ids = call.arguments.value("ids", Json::array());
+                        if (ids.is_array() && !ids.empty())
+                            completedAction = L"已替换播放队列，共 " +
+                                              std::to_wstring(ids.size()) + L" 首歌。";
+                    } else if (call.name == "music_play" ||
+                               call.name == "music_play_random") {
+                        completedAction = L"已提交播放请求。";
+                    } else if (completedWrite) {
+                        completedAction = L"已执行请求的操作。";
+                    }
                 }
                 auto text = result.dump();
                 // The trace is evidence for a human, not a second copy of the data.
@@ -925,16 +1115,47 @@ namespace mora {
                     {"arguments", call.arguments},
                     {"resultBytes", static_cast<int64_t>(text.size())},
                     {"resultSummary", summarize(text, 400)}});
-                if (messages.size() >= static_cast<size_t>(config.maxContextMessages)) {
-                    outcome.code = "context_budget";
-                    outcome.error = "context message budget exhausted";
-                    return outcome;
-                }
                 messages.push_back(Json{{"role", "tool"},
                                         {"tool_call_id", call.id},
                                         {"content", text}});
+                if (multiSongPlayback && call.name == "music_recommend_queue" &&
+                    result.is_object() && result.contains("error")) {
+                    auto code = result.value("error", std::string("tool_failed"));
+                    auto message = result.value("message", std::string());
+                    // The deterministic short-circuit must not claim a cause it cannot know: the
+                    // tool distinguishes "nothing playable" from a player or account problem.
+                    outcome.text =
+                        code == "no_candidates"
+                            ? L"没找到可播放的曲目，播放队列没有改变。可以说「从我的歌单挑 N 首」"
+                              L"或「我喜欢的歌」，也可以换个关键词。"
+                        : code == "no_likes"
+                            ? L"这个账号没有红心歌曲（或未登录），播放队列没有改变。"
+                        : code == "needs_player"
+                            ? L"播放器当前不可用，请先启动 MORA。"
+                        : code == "needs_login" || code == "unauthorized"
+                            ? L"账号登录已失效，请先在终端重新登录，播放队列没有改变。"
+                            : L"这次未能确认播放队列已替换（" + unutf8(code) +
+                                  (message.empty() ? L"" : L"：" + unutf8(message)) + L"）。";
+                    outcome.ok = true;
+                    return outcome;
+                }
+            }
+            if (completedWrite) {
+                if (finishWithoutTools()) {
+                    if (!requiredCountInAnswer.empty() &&
+                        outcome.text.find(requiredCountInAnswer) == std::wstring::npos)
+                        outcome.text = completedAction;
+                    return outcome;
+                }
+                outcome.text = completedAction;
+                outcome.ok = true;
+                return outcome;
             }
         }
+        // The requested action may already have succeeded. Give the model one final chance to
+        // describe the observed tool results without allowing another tool round.
+        if (finishWithoutTools())
+            return outcome;
         outcome.code = "round_budget";
         outcome.error = "model kept requesting tools without answering";
         return outcome;

@@ -1,7 +1,12 @@
 #include "service.hpp"
+#include <random>
 
 namespace mora {
     namespace {
+        // The same five quality levels the terminal exposes, so "switch to lossless" is a real
+        // operation for the agent instead of a terminal-only feature.
+        constexpr std::array<const char*, 5> qualityLevels{"standard", "higher", "exhigh",
+                                                           "lossless", "hires"};
         int boundedInteger(const Json& args, const char* name, int fallback, int minimum,
                            int maximum) {
             if (!args.contains(name))
@@ -228,17 +233,23 @@ namespace mora {
             {"title", "控制当前播放"},
             {"description",
              "Modify the running player's session: pause, resume, next, previous, seek (value in "
-             "seconds) or volume (value 0..100). Never creates a second player; fails with "
-             "needs_player when no terminal player is attached."},
+             "seconds), volume (value 0..100) or quality (level: standard/higher/exhigh/lossless/"
+             "hires; it applies from the next track and whether it is really available depends on "
+             "the account's permissions). Never creates a second player; fails with needs_player "
+             "when no terminal player is attached."},
             {"inputSchema",
              Json{{"type", "object"},
                   {"properties",
                    Json{{"action",
                          Json{{"type", "string"},
                               {"enum", Json::array({"pause", "resume", "next", "previous", "seek",
-                                                    "volume"})}}},
+                                                    "volume", "quality"})}}},
                         {"value", Json{{"type", "number"},
-                                       {"description", "seconds for seek, 0..100 for volume"}}}}},
+                                       {"description", "seconds for seek, 0..100 for volume"}}},
+                        {"level", Json{{"type", "string"},
+                                       {"enum", Json::array({"standard", "higher", "exhigh",
+                                                             "lossless", "hires"})},
+                                       {"description", "Required for action=quality."}}}}},
                   {"required", Json::array({"action"})},
                   {"additionalProperties", false}}},
             {"annotations", Json{{"readOnlyHint", false},
@@ -285,6 +296,43 @@ namespace mora {
                                  {"destructiveHint", false},
                                  {"idempotentHint", true},
                                  {"openWorldHint", true}}}});
+        tools.push_back(Json{
+            {"name", "music_recommend_queue"},
+            {"title", "按取向或我的歌单批量替换播放队列"},
+            {"description",
+             "Replace the queue with N songs in one call, including 10, 100 or 1000. "
+             "source=search draws from real song search for the given intent; source=playlists "
+             "draws from the account's own and subscribed playlists (for '从我的歌单/我的收藏挑 N "
+             "首', intent is ignored); source=liked draws from the liked songs ('我喜欢的歌/红心', "
+             "intent is ignored as the liked list has no keyword ranking); source=auto searches "
+             "first and falls back to the playlists only when the search returns nothing at all - a "
+             "thin result is reported honestly instead of being topped up with unrelated tracks. "
+             "Selects distinct candidates, replaces the queue once and starts the first song. Do "
+             "not call music_play_random repeatedly for a multi-song request, and do not queue "
+             "songs one by one. Returns requestedCount, queuedCount and the source actually used; "
+             "report any shortfall honestly."},
+            {"inputSchema", Json{{"type", "object"},
+                                  {"properties", Json{{"intent", Json{{"type", "string"},
+                                                                        {"maxLength", 120},
+                                                                        {"description",
+                                                                         "Style, scene, mood or "
+                                                                         "artist; required for "
+                                                                         "source=search."}}},
+                                                      {"count", Json{{"type", "integer"},
+                                                                       {"minimum", 1},
+                                                                       {"maximum", 1000},
+                                                                       {"default", 30}}},
+                                                      {"source", Json{{"type", "string"},
+                                                                        {"enum", Json::array(
+                                                                             {"auto", "search",
+                                                                              "playlists",
+                                                                              "liked"})},
+                                                                        {"default", "auto"}}},
+                                                      {"seed", Json{{"type", "integer"},
+                                                                      {"minimum", 1}}}}},
+                                  {"additionalProperties", false}}},
+            {"annotations", Json{{"readOnlyHint", false}, {"destructiveHint", true},
+                                   {"idempotentHint", false}, {"openWorldHint", true}}}});
         tools.push_back(Json{
             {"name", "music_recommend"},
             {"title", "推荐真实候选"},
@@ -349,6 +397,41 @@ namespace mora {
                                        {"default", 20}}},
                         {"offset", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", 5000},
                                         {"default", 0}}}}},
+                  {"additionalProperties", false}}},
+            {"annotations", Json{{"readOnlyHint", true},
+                                 {"destructiveHint", false},
+                                 {"idempotentHint", true},
+                                 {"openWorldHint", true}}}});
+        tools.push_back(Json{
+            {"name", "music_list_likes"},
+            {"title", "列出我红心的歌曲"},
+            {"description",
+             "List the songs this account has hearted ('我喜欢的音乐' / 红心). Paginated and bounded; "
+             "returns real ids with metadata when it can be resolved. Use it to answer what is in the "
+             "liked list, or to hand ids to music_queue_edit; for 'play my liked songs' prefer "
+             "music_recommend_queue(source=liked, count=N) in one call."},
+            {"inputSchema",
+             Json{{"type", "object"},
+                  {"properties",
+                   Json{{"limit", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 50},
+                                       {"default", 20}}},
+                        {"offset", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", 5000},
+                                        {"default", 0}}}}},
+                  {"additionalProperties", false}}},
+            {"annotations", Json{{"readOnlyHint", true},
+                                 {"destructiveHint", false},
+                                 {"idempotentHint", true},
+                                 {"openWorldHint", true}}}});
+        tools.push_back(Json{
+            {"name", "music_get_like"},
+            {"title", "查询一首歌是否已红心"},
+            {"description",
+             "Read one song's liked state on the signed-in account, so the model never has to guess "
+             "or page the whole liked list. Read-only; use music_set_like to change it."},
+            {"inputSchema",
+             Json{{"type", "object"},
+                  {"properties", Json{{"songId", Json{{"type", "integer"}, {"minimum", 1}}}}},
+                  {"required", Json::array({"songId"})},
                   {"additionalProperties", false}}},
             {"annotations", Json{{"readOnlyHint", true},
                                  {"destructiveHint", false},
@@ -432,8 +515,9 @@ namespace mora {
              "everything already queued). Row indexes are 0-based, exactly like "
              "music_play.startIndex. Out-of-range indexes, unknown ops and unknown fields return "
              "invalid_arguments and change nothing. Returns the new queue state. Choose like a "
-             "normal player: for a whole album or playlist use music_play(kind=album or playlist) or "
-             "music_open_collection, which replaces the queue with that collection and plays it; for "
+             "normal player: for a whole album or playlist use music_play(kind=album or playlist), "
+             "which replaces the queue with that collection and plays it (music_open_collection only "
+             "lists its tracks and never starts playback); for "
              "an artist, style, scene or mood that has no single album, search first (music_search "
              "with limit 10..30), then build the queue in one call with op=replace and 5..20 ids so "
              "several songs really play - queueing only one song is a defect; when the user says "
@@ -469,10 +553,10 @@ namespace mora {
                                      "One song id for replace, add_next or append (id or ids, not "
                                      "both)."}}},
                         {"ids", Json{{"type", "array"},
-                                     {"maxItems", 100},
+                                     {"maxItems", 1000},
                                      {"items", Json{{"type", "integer"}, {"minimum", 1}}},
                                      {"description",
-                                      "Song ids: up to 100 for replace (a whole series), up to 50 "
+                                      "Song ids: up to 1000 for replace (a whole series), up to 50 "
                                       "for add_next or append."}}}}},
                   {"required", Json::array({"op"})},
                   {"additionalProperties", false}}},
@@ -501,6 +585,12 @@ namespace mora {
     bool MusicService::attached() const {
         return static_cast<bool>(link);
     }
+    void MusicService::useTransport(Api::Transport adapter) {
+        // The injected transport survives releaseBackend(), so a thin adapter can drop and rebuild
+        // its backend between calls and still be exercised by the same deterministic stub.
+        transport = std::move(adapter);
+        api.reset();
+    }
     BridgeReply MusicService::session(const std::string& method, const Json& params) {
         if (!link)
             throw ToolError("needs_player",
@@ -515,9 +605,10 @@ namespace mora {
     void MusicService::releaseBackend() {
         api.reset();
     }
-    Api& MusicService::backend() {
+    Api& MusicService::backend() const {
         if (!api)
-            api = std::make_unique<Api>();
+            api = transport ? std::make_unique<Api>(stateDirectory(), transport)
+                            : std::make_unique<Api>();
         return *api;
     }
     SearchPage MusicService::search(std::wstring query, Kind kind, int offset) {
@@ -569,13 +660,28 @@ namespace mora {
         backend().resume();
     }
     std::wstring MusicService::nickname() const {
-        return api ? api->nickname : L"未登录";
+        // Materialise the backend: the saved session already knows the nickname, and reporting
+        // "未登录" before the first network call was a lie after a restart. A damaged session file
+        // must fall back to the neutral value instead of taking the caller down with it.
+        try {
+            return backend().nickname;
+        } catch (const std::exception&) {
+            return L"未登录";
+        }
     }
     int64_t MusicService::uid() const {
-        return api ? api->uid : 0;
+        try {
+            return backend().uid;
+        } catch (const std::exception&) {
+            return 0;
+        }
     }
     std::set<int64_t> MusicService::likes() const {
-        return api ? api->likes : std::set<int64_t>{};
+        try {
+            return backend().likes;
+        } catch (const std::exception&) {
+            return {};
+        }
     }
     Json MusicService::searchTool(std::wstring query, Kind kind, int offset, int limit) {
         std::string kindText =
@@ -617,9 +723,36 @@ namespace mora {
         }
         auto items = kind == "album" ? album(id) : playlist(id);
         Json page = {{"total", static_cast<int>(items.size())}, {"items", Json::array()}};
+        std::vector<int64_t> unresolved;
         for (size_t i = static_cast<size_t>(std::min<int>(offset, static_cast<int>(items.size())));
-             i < items.size() && static_cast<int>(page["items"].size()) < limit; ++i)
+             i < items.size() && static_cast<int>(page["items"].size()) < limit; ++i) {
             page["items"].push_back(trackJson(items[i]));
+            if (items[i].name.empty() && items[i].id > 0)
+                unresolved.push_back(items[i].id);
+        }
+        // The provider only resolves metadata for the first rows of a collection, so a page beyond
+        // that would otherwise come back with real ids but no names. Resolve just this page's
+        // unresolved rows (details takes at most 50 ids per call) and ignore a failed lookup, which
+        // leaves the bare ids intact.
+        if (!unresolved.empty()) {
+            std::map<int64_t, Track> known;
+            try {
+                for (size_t start = 0; start < unresolved.size(); start += 50) {
+                    std::vector<int64_t> chunk(
+                        unresolved.begin() + static_cast<std::ptrdiff_t>(start),
+                        unresolved.begin() + static_cast<std::ptrdiff_t>(
+                                                 std::min(unresolved.size(), start + 50)));
+                    for (auto& track : details(chunk))
+                        known[track.id] = track;
+                }
+            } catch (const ApiError&) {
+            }
+            for (auto& item : page["items"]) {
+                auto found = known.find(item.value("id", (int64_t)0));
+                if (found != known.end())
+                    item = trackJson(found->second);
+            }
+        }
         return page;
     }
     Json MusicService::libraryTool(bool ownedOnly) {
@@ -631,8 +764,12 @@ namespace mora {
                 throw ToolError(reply.code.empty() ? "player_error" : reply.code, reply.message);
         }
         Json items = Json::array();
+        // Resolve the list before reading the account id: myPlaylists() runs account() on its first
+        // use, and comparing the creator against a not-yet-loaded id would mark every playlist as
+        // "somebody else's" and hide the write actions the user really has.
+        auto playlists = library(ownedOnly);
         auto me = uid();
-        for (auto& playlist : library(ownedOnly)) {
+        for (auto& playlist : playlists) {
             auto item = trackJson(playlist);
             item["owner"] = playlist.owner == me;
             item["canWrite"] = playlist.owner == me;
@@ -740,16 +877,24 @@ namespace mora {
             return Json{{"stage", "m4-session-bridge"},
                         {"playerSessionAttached", live},
                         {"session", view},
+                        // Read-only identity so the model can tell whether "my playlists" and
+                        // "my liked songs" are even available, without exposing any credential.
+                        {"account", Json{{"signedIn", uid() > 0}, {"nickname", utf8(nickname())}}},
                         {"memoryBudgetMB", 50},
                         {"implemented", Json::array({"metadata_search", "mcp_stdio_handshake",
                                                      "collection_paging",
+                                                     "collection_page_metadata",
                                                      "shared_session_playback",
                                                      "playback_control",
+                                                     "quality_control",
                                                      "queue_control",
                                                      "playback_modes",
                                                      "deterministic_recommendation",
                                                      "random_playback",
+                                                     "batch_queue_from_search_playlists_likes",
                                                      "playlist_listing",
+                                                     "liked_listing",
+                                                     "like_state_query",
                                                      "account_write_tools",
                                                      "integration_status"})},
                         {"separateTerminalPlayerAvailable", true},
@@ -768,14 +913,16 @@ namespace mora {
             return session("play", Json{{"kind", kind}, {"id", id}, {"startIndex", start}}).data;
         }
         if (name == "music_control") {
-            onlyArguments(args, {"action", "value"});
+            onlyArguments(args, {"action", "value", "level"});
             if (!args.contains("action") || !args["action"].is_string())
                 throw ToolError("invalid_arguments", "action must be a string");
             auto action = args["action"].get<std::string>();
             if (action != "pause" && action != "resume" && action != "next" &&
-                action != "previous" && action != "seek" && action != "volume")
+                action != "previous" && action != "seek" && action != "volume" &&
+                action != "quality")
                 throw ToolError("invalid_arguments",
-                                "action must be pause, resume, next, previous, seek or volume");
+                                "action must be pause, resume, next, previous, seek, volume or "
+                                "quality");
             Json params = {{"action", action}};
             if (args.contains("value")) {
                 if (!args["value"].is_number())
@@ -784,6 +931,18 @@ namespace mora {
             }
             if ((action == "seek" || action == "volume") && !params.contains("value"))
                 throw ToolError("invalid_arguments", action + " needs a value");
+            if (action == "quality") {
+                if (!args.contains("level") || !args["level"].is_string())
+                    throw ToolError("invalid_arguments", "quality needs a level string");
+                auto level = args["level"].get<std::string>();
+                bool known = false;
+                for (auto candidate : qualityLevels)
+                    known = known || level == candidate;
+                if (!known)
+                    throw ToolError("invalid_arguments",
+                                    "level must be standard, higher, exhigh, lossless or hires");
+                params["level"] = level;
+            }
             return session("control", params).data;
         }
         if (name == "music_open_collection") {
@@ -792,7 +951,16 @@ namespace mora {
             int64_t id = positiveInteger(args, "id");
             int offset = boundedInteger(args, "offset", 0, 0, 3000);
             int limit = boundedInteger(args, "limit", 50, 1, 100);
-            auto page = collectionTool(kind, id, offset, limit);
+            // A provider failure keeps its machine-readable code instead of degrading into a bare
+            // text error the host has to parse.
+            Json page;
+            try {
+                page = collectionTool(kind, id, offset, limit);
+            } catch (const ApiError& error) {
+                throwApiError(error);
+            } catch (const std::runtime_error& error) {
+                throw ToolError("session_error", error.what());
+            }
             return Json{{"kind", kind},
                         {"id", id},
                         {"offset", offset},
@@ -811,6 +979,152 @@ namespace mora {
                 throw ToolError("needs_player",
                                 "no track is playing; pass songId or start playback first");
             return page;
+        }
+        if (name == "music_recommend_queue") {
+            onlyArguments(args, {"intent", "count", "seed", "source"});
+            auto source = args.value("source", std::string("auto"));
+            if (source != "auto" && source != "search" && source != "playlists" &&
+                source != "liked")
+                throw ToolError("invalid_arguments",
+                                "source must be auto, search, playlists or liked");
+            auto intent = args.value("intent", std::string());
+            if (intent.size() > 120)
+                throw ToolError("invalid_arguments", "intent must be at most 120 characters");
+            if (source == "search" && intent.empty())
+                throw ToolError("invalid_arguments", "intent is required when source is search");
+            int count = boundedInteger(args, "count", 30, 1, 1000);
+            auto status = link ? link("status", Json::object())
+                               : BridgeReply(false, "needs_player", "no MORA player attached",
+                                             Json::object());
+            if (!status.ok)
+                throw ToolError(status.code.empty() ? "needs_player" : status.code,
+                                status.message);
+            std::vector<int64_t> ids;
+            std::set<int64_t> seen;
+            auto collect = [&](const Json& items) {
+                for (const auto& item : items) {
+                    int64_t id = item.value("id", (int64_t)0);
+                    if (id > 0 && seen.insert(id).second)
+                        ids.push_back(id);
+                }
+            };
+            auto fillFromSearch = [&]() {
+                auto fullQuery = unutf8(intent);
+                std::vector<std::wstring> queries{fullQuery};
+                // Music search often treats a whole taste sentence as one exact query. Broaden it
+                // to its individual style terms only when the specific query has too few hits.
+                for (size_t start = 0; start < fullQuery.size();) {
+                    auto end = fullQuery.find_first_of(L" \t,，、;/|", start);
+                    if (end == std::wstring::npos)
+                        end = fullQuery.size();
+                    auto term = fullQuery.substr(start, end - start);
+                    if (term.size() >= 2 &&
+                        std::find(queries.begin(), queries.end(), term) == queries.end())
+                        queries.push_back(std::move(term));
+                    start = end + 1;
+                }
+                for (const auto& query : queries) {
+                    for (int offset = 0; offset < 3000 && (int)ids.size() < count; offset += 30) {
+                        auto page = searchTool(query, Kind::Song, offset, 30);
+                        int total = page.value("total", 0);
+                        auto items = page.value("items", Json::array());
+                        collect(items);
+                        if (items.size() < 30 || offset + 30 >= total)
+                            break;
+                    }
+                    if ((int)ids.size() >= count)
+                        break;
+                }
+            };
+            auto fillFromPlaylists = [&](uint64_t seed) {
+                // The playlists are the source, not a search: read each collection and take its ids,
+                // stopping as soon as the requested count is covered. At most four playlists are
+                // read, so a large count can never fan out into a request storm.
+                auto playlists = libraryTool(false);
+                if (playlists.empty())
+                    return;
+                size_t start = static_cast<size_t>(seed % playlists.size());
+                for (size_t used = 0; used < 4 && used < playlists.size() &&
+                                      (int)ids.size() < count;
+                     ++used) {
+                    auto& playlist = playlists[(start + used) % playlists.size()];
+                    int64_t playlistId = playlist.value("id", (int64_t)0);
+                    if (playlistId <= 0)
+                        continue;
+                    for (int offset = 0; offset < 1000 && (int)ids.size() < count; offset += 100) {
+                        auto page = collectionTool("playlist", playlistId, offset, 100);
+                        auto items = page.value("items", Json::array());
+                        collect(items);
+                        if (items.size() < 100)
+                            break;
+                    }
+                }
+            };
+            auto fillFromLikes = [&]() {
+                // Liked ids are account state, restored by account() rather than by session.bin.
+                auto liked = likes();
+                if (liked.empty()) {
+                    try {
+                        account();
+                    } catch (const ApiError& error) {
+                        throwApiError(error);
+                    }
+                    liked = likes();
+                }
+                for (auto id : liked) {
+                    if (id > 0 && seen.insert(id).second)
+                        ids.push_back(id);
+                    if ((int)ids.size() >= count)
+                        break;
+                }
+            };
+            uint64_t seed = args.contains("seed")
+                                ? static_cast<uint64_t>(positiveInteger(args, "seed"))
+                                : static_cast<uint64_t>(Clock::now().time_since_epoch().count());
+            std::string usedSource;
+            if (source == "search" || (source == "auto" && !intent.empty())) {
+                fillFromSearch();
+                usedSource = "search";
+            }
+            if (source == "liked") {
+                fillFromLikes();
+                usedSource = "liked";
+            }
+            // auto falls back to the user's playlists only when the search found nothing at all:
+            // topping up a thin search result with unrelated playlist tracks would quietly change
+            // what the user asked for, and an honest shortfall is better than a mixed queue.
+            size_t afterSearch = ids.size();
+            if (source == "playlists" || (source == "auto" && ids.empty())) {
+                fillFromPlaylists(seed);
+                if (ids.size() > afterSearch)
+                    usedSource = usedSource.empty() ? "playlists" : usedSource + "+playlists";
+                else if (usedSource.empty())
+                    usedSource = "playlists";
+            }
+            if (ids.empty())
+                throw ToolError("no_candidates",
+                                source == "playlists"
+                                    ? "the signed-in account has no playable playlist tracks"
+                                : source == "liked"
+                                    ? "the signed-in account has no liked songs"
+                                : source == "auto"
+                                    ? "no real songs found by search or in the user's playlists"
+                                    : "no real songs found for that intent");
+            auto availableCount = ids.size();
+            std::mt19937_64 random(seed);
+            std::shuffle(ids.begin(), ids.end(), random);
+            if (ids.size() > static_cast<size_t>(count))
+                ids.resize(static_cast<size_t>(count));
+            auto reply = link("queue_edit", Json{{"op", "replace"}, {"ids", ids}});
+            if (!reply.ok)
+                throw ToolError(reply.code.empty() ? "player_error" : reply.code, reply.message);
+            return Json{{"requestedCount", count},
+                        {"queuedCount", ids.size()},
+                        {"availableCount", availableCount},
+                        {"source", usedSource},
+                        {"searchIntent", intent},
+                        {"changed", reply.data.value("changed", false)},
+                        {"playback", "submitted"}};
         }
         if (name == "music_recommend") {
             onlyArguments(args, {"intent", "source", "limit", "seed"});
@@ -980,7 +1294,14 @@ namespace mora {
             }
             int limit = boundedInteger(args, "limit", 20, 1, 50);
             int offset = boundedInteger(args, "offset", 0, 0, 5000);
-            auto items = libraryTool(ownedOnly);
+            Json items;
+            try {
+                items = libraryTool(ownedOnly);
+            } catch (const ApiError& error) {
+                throwApiError(error);
+            } catch (const std::runtime_error& error) {
+                throw ToolError("session_error", error.what());
+            }
             Json page = {{"ownedOnly", ownedOnly},
                          {"offset", offset},
                          {"total", static_cast<int64_t>(items.size())},
@@ -989,6 +1310,77 @@ namespace mora {
                  i < items.size() && static_cast<int>(page["items"].size()) < limit; ++i)
                 page["items"].push_back(items[i]);
             return page;
+        }
+        if (name == "music_list_likes") {
+            onlyArguments(args, {"limit", "offset"});
+            int limit = boundedInteger(args, "limit", 20, 1, 50);
+            int offset = boundedInteger(args, "offset", 0, 0, 5000);
+            // The liked ids are account state, populated by account() rather than by session.bin,
+            // so a cold start refreshes them once instead of reporting an empty hearted list.
+            auto liked = likes();
+            if (liked.empty()) {
+                try {
+                    account();
+                } catch (const ApiError& error) {
+                    throwApiError(error);
+                }
+                liked = likes();
+            }
+            // Two very different causes, two codes: a signed-out session is fixable by the user,
+            // an empty liked list is simply empty.
+            if (liked.empty() && uid() == 0)
+                throw ToolError("needs_login",
+                                "not signed in to a music account; sign in in the terminal first");
+            if (liked.empty())
+                throw ToolError("no_likes", "this account has no liked songs yet");
+            std::vector<int64_t> page;
+            int index = 0;
+            for (auto id : liked) {
+                if (index++ < offset)
+                    continue;
+                if (static_cast<int>(page.size()) >= limit)
+                    break;
+                page.push_back(id);
+            }
+            // Metadata is a nicety: a failed detail lookup must still return the real ids.
+            std::map<int64_t, Track> known;
+            try {
+                if (!page.empty())
+                    for (auto& track : details(page))
+                        known[track.id] = track;
+            } catch (const ApiError&) {
+            }
+            Json items = Json::array();
+            for (auto id : page) {
+                auto found = known.find(id);
+                items.push_back(found == known.end() ? Json{{"id", id}}
+                                                      : trackJson(found->second));
+            }
+            return Json{{"total", static_cast<int64_t>(liked.size())},
+                        {"offset", offset},
+                        {"limit", limit},
+                        {"items", items}};
+        }
+        if (name == "music_get_like") {
+            onlyArguments(args, {"songId"});
+            int64_t songId = positiveInteger(args, "songId");
+            auto liked = likes();
+            if (liked.empty()) {
+                try {
+                    account();
+                } catch (const ApiError& error) {
+                    throwApiError(error);
+                } catch (const std::runtime_error& error) {
+                    throw ToolError("session_error", error.what());
+                }
+                liked = likes();
+            }
+            if (uid() == 0)
+                throw ToolError("needs_login",
+                                "not signed in to a music account; sign in in the terminal first");
+            return Json{{"songId", songId},
+                        {"liked", liked.contains(songId)},
+                        {"likedTotal", static_cast<int64_t>(liked.size())}};
         }
         if (name == "music_set_like") {
             onlyArguments(args, {"songId", "liked"});
@@ -1109,9 +1501,10 @@ namespace mora {
                 onlyArguments(args, {"op", "id", "ids"});
                 if (args.contains("id") && args.contains("ids"))
                     throw ToolError("invalid_arguments", "pass id or ids, not both");
-                // replace builds a fresh series (at most 100); append/add_next extend a queue that
-                // is already playing (at most 50, so one call can never become a request storm).
-                int maxIds = op == "replace" ? 100 : 50;
+                // replace builds a fresh series (at most 1000, matching the player); append/add_next
+                // extend a queue that is already playing (at most 50, so one call can never become
+                // a request storm).
+                int maxIds = op == "replace" ? 1000 : 50;
                 std::vector<int64_t> ids;
                 if (args.contains("id"))
                     ids.push_back(positiveInteger(args, "id"));

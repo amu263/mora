@@ -19,7 +19,7 @@
 
 namespace mora {
     enum class Modal { None, SavedSession, Login, Qr, Phone, Code, Save, Help, Quality, Guide, Ai, AiKey, AiModel, AiModels, Agent, Settings, Name,
-                       Persona, Device, Stats };
+                       Persona, Device, Stats, Effort };
     enum Action {
         A_Search = 1,
         A_Songs,
@@ -64,6 +64,8 @@ namespace mora {
         A_Device,
         A_Mode,
         A_Detail,
+        A_ChatOpen,
+        A_EffortOpen,
         A_ReactToggle,
         A_ReactSlower,
         A_ReactFaster,
@@ -78,6 +80,7 @@ namespace mora {
         A_StatsMonth,
         A_StatsYear,
         A_ModelRow = 70000,
+        A_EffortRow = 80000,
         A_PersonaRow = 50000,
         A_DeviceRow = 60000,
         A_Progress = 80,
@@ -169,6 +172,10 @@ namespace mora {
         bool guideDone = false;
         int guidePage = 0;
         int chatScroll = 0;
+        // Geometry of the conversation dock that stays visible on browse/route pages, so a wheel
+        // over it scrolls the conversation instead of the result list under the cursor.
+        bool chatDockVisible = false;
+        int chatDockLeft = 0, chatDockRight = 0, chatDockTop = 0, chatDockBottom = 0;
         bool selecting = false, selectionMoved = false;
         COORD selectionStart{}, selectionEnd{};
         int qrGeneration = 0;
@@ -481,16 +488,44 @@ namespace mora {
         // Reasoning strength mirrors DST's ladder; `off` sends no reasoning field at all.
         static constexpr std::array<const char*, 8> effortLevels{"",     "off",  "minimal", "low",
                                                                  "medium", "high", "xhigh",   "max"};
+        int effortSelected = 0;
+        std::string effortCurrent; // what the picker opened with, so drawing needs no file read
         std::wstring effortLabel(const std::string& level) const {
             return level.empty() ? L"provider 默认" : unutf8(level);
         }
-        bool setReasoningEffort(const std::string& level) {
+        // The ladder is what the provider accepts; the UI also advertises the word "default" for
+        // "no field at all", so the value the user was told to type is accepted here instead of
+        // being rejected as an unknown level.
+        static std::string normalizedEffort(const std::string& level) {
+            return level == "default" || level == "provider" || level == "auto" ? std::string()
+                                                                               : level;
+        }
+        bool setReasoningEffort(const std::string& requested) {
+            auto level = normalizedEffort(requested);
             if (std::find(effortLevels.begin(), effortLevels.end(), level) == effortLevels.end())
                 return false;
             auto config = loadAgentConfig();
             config.reasoningEffort = level;
             saveAgentConfig(config);
             message(L"思考强度 · " + effortLabel(level));
+            return true;
+        }
+        // A list the user can actually pick from: ↑↓ moves, Enter applies, the mouse works too.
+        void openEffortPicker() {
+            auto config = loadAgentConfig();
+            effortCurrent = config.reasoningEffort;
+            effortSelected = 0;
+            for (size_t i = 0; i < effortLevels.size(); ++i)
+                if (effortCurrent == effortLevels[i])
+                    effortSelected = static_cast<int>(i);
+            modal = Modal::Effort;
+        }
+        bool selectReasoningEffort(int index) {
+            if (index < 0 || index >= static_cast<int>(effortLevels.size()))
+                return false;
+            if (!setReasoningEffort(effortLevels[(size_t)index]))
+                return false;
+            modal = Modal::None;
             return true;
         }
         // The Windows output device list is read on demand; selecting one takes effect immediately
@@ -601,12 +636,15 @@ namespace mora {
             if (!extraSystem.empty())
                 systemPrompt += L"\n" + extraSystem;
             auto personaId = persona.id;
+            auto tasteSeed = utf8(personaSearchSeed(persona));
+            bool genericTaste = usePersonaSearchSeed(prompt);
             auto memory = conversationHistory(conversation, 24);
             bool compress = autoCompress;
             int contextLimit = contextLimitTokens;
             chatThread = std::thread([this, request, text = utf8(prompt), remember,
                                       systemPrompt = std::move(systemPrompt),
                                       personaId = std::move(personaId),
+                                      tasteSeed = std::move(tasteSeed), genericTaste,
                                       memory = std::move(memory), compress, contextLimit] {
                 Reply reply;
                 reply.request = request;
@@ -618,9 +656,8 @@ namespace mora {
                     config.autoCompress = compress;
                     if (contextLimit > 0)
                         config.contextTokens = contextLimit;
-                    auto outcome = runChatLoop(
-                        config, text,
-                        [this, request, &confirmedLikes,
+                    MusicToolExecutor execute = [this, request, &confirmedLikes, &tasteSeed,
+                         genericTaste,
                          &createdPersonas](const std::string& name, const Json& args) {
                             // Persona creation stays in the terminal process: it is the player's
                             // own store, not a music-account action, and it never goes through MCP.
@@ -642,7 +679,11 @@ namespace mora {
                                 createdPersonas.push_back(result);
                                 return result;
                             }
-                            auto result = work.callTool(request, name, args);
+                            Json submitted = args;
+                            if (name == "music_recommend_queue" && genericTaste &&
+                                submitted.is_object())
+                                submitted["intent"] = tasteSeed;
+                            auto result = work.callTool(request, name, submitted);
                             if (name == "music_set_like" && result.is_object() &&
                                 result.contains("songId") && result.contains("liked"))
                                 confirmedLikes.push_back(Json{{"songId", result["songId"]},
@@ -651,8 +692,8 @@ namespace mora {
                                 result.contains("id"))
                                 createdPersonas.push_back(result);
                             return result;
-                        },
-                        {}, systemPrompt, memory);
+                        };
+                    auto outcome = runChatLoop(config, text, execute, {}, systemPrompt, memory);
                     reply.data = Json{{"ok", outcome.ok},
                                       {"code", outcome.code},
                                       {"error", outcome.error},
@@ -914,17 +955,11 @@ namespace mora {
                 modal = Modal::Guide;
             }
             else if (verb == L"effort") {
-                auto config = loadAgentConfig();
-                if (args.empty()) {
-                    std::wstring list;
-                    for (auto level : effortLevels) {
-                        if (!list.empty())
-                            list += L" / ";
-                        list += level[0] ? unutf8(level) : L"default";
-                    }
-                    message(L"当前思考强度 " + effortLabel(config.reasoningEffort) + L" · 可用 " +
-                            list);
-                } else if (!setReasoningEffort(utf8(args)))
+                // No argument opens the picker instead of only printing the ladder, so the level can
+                // be chosen with ↑↓ / Enter / mouse; an explicit level still applies directly.
+                if (args.empty())
+                    openEffortPicker();
+                else if (!setReasoningEffort(utf8(args)))
                     message(L"可用档位：default / off / minimal / low / medium / high / xhigh / "
                             L"max");
             } else if (verb == L"audio-device") {
@@ -1218,6 +1253,18 @@ namespace mora {
                 detail = false;
                 return;
             }
+            // Esc collapses the expanded conversation back to the page behind it; the conversation
+            // itself stays docked there, so nothing the user was reading is lost.
+            if (chatView) {
+                if (!input.empty()) {
+                    input.clear();
+                    inputCursor = 0;
+                    return;
+                }
+                chatView = false;
+                searchFocus = false;
+                return;
+            }
             if (searchFocus) {
                 input.clear();
                 inputCursor = 0;
@@ -1253,6 +1300,12 @@ namespace mora {
             if (a >= A_ModelRow && a < A_ModelRow + 64) {
                 modelSelected = a - A_ModelRow;
                 adoptModel(modelSelected);
+                return;
+            }
+            // Checked before the suggestion range below: A_EffortRow is larger than A_Suggestion,
+            // and that range test would otherwise swallow the picker's rows.
+            if (a >= A_EffortRow && a < A_EffortRow + 16) {
+                selectReasoningEffort(a - A_EffortRow);
                 return;
             }
             if (a >= A_Suggestion) {
@@ -1397,6 +1450,18 @@ namespace mora {
                 break;
             case A_Home:
                 goHome();
+                break;
+            case A_ChatOpen:
+                // One click on the docked conversation (or T) brings the whole conversation back,
+                // with the composer already focused so the user can keep chatting.
+                chatView = true;
+                home = false;
+                searchFocus = true;
+                inputCursor = input.size();
+                message(chatLog.empty() ? L"输入想聊的音乐话题" : L"对话已展开 · Esc 收起");
+                break;
+            case A_EffortOpen:
+                openEffortPicker();
                 break;
             case A_AI:
                 modal = Modal::Ai;
@@ -1564,6 +1629,7 @@ namespace mora {
             int64_t songId = params.value("songId", (int64_t)0);
             int64_t playlistId = params.value("playlistId", (int64_t)0);
             bool includeTranslation = params.value("includeTranslation", true);
+            bool ownedOnly = params.value("ownedOnly", true);
             int maxLines = std::clamp(params.value("maxLines", 60), 1, 200);
             // Lyrics need the live track and position, which only this thread owns. Serve the cached
             // copy when it is the same song; otherwise fetch once on the worker.
@@ -1592,7 +1658,7 @@ namespace mora {
             auto posted = work.postAdapter(
                 ticket, "ipc-" + method,
                 [method, query, kind, offset, limit, id, liked, songId, playlistId,
-                 includeTranslation, maxLines, lyricTrack, lyricPosition,
+                 includeTranslation, ownedOnly, maxLines, lyricTrack, lyricPosition,
                  ticket](MusicService& s) {
                     Reply r;
                     r.type = "ipc-" + method;
@@ -1607,10 +1673,14 @@ namespace mora {
                     }
                     if (method == "playlists") {
                         // The player knows whose playlists these are: mark writability here so the
-                        // adapter never has to guess with a possibly stale uid.
+                        // adapter never has to guess with a possibly stale uid. The list is resolved
+                        // first because that call is what loads the account id on a cold start, and
+                        // the requested scope is honoured: hardcoding "mine only" here would drop
+                        // every subscribed playlist from a listing that asked for all of them.
+                        auto list = s.library(ownedOnly);
                         auto uid = s.uid();
                         Json items = Json::array();
-                        for (auto& playlist : s.library(true)) {
+                        for (auto& playlist : list) {
                             auto item = trackJson(playlist);
                             item["owner"] = playlist.owner == uid;
                             item["canWrite"] = playlist.owner == uid;
@@ -1640,6 +1710,45 @@ namespace mora {
                     } else {
                         r.items = kind == "album" ? s.album(id) : s.playlist(id);
                         r.total = (int)r.items.size();
+                        // Honour the requested window. Slicing by limit alone made every page of a
+                        // collection return the first rows, so an adapter asking for offset=50 got
+                        // offset=0 - and the reply still echoed the offset it never applied.
+                        if (offset > 0) {
+                            if (offset >= (int)r.items.size())
+                                r.items.clear();
+                            else
+                                r.items.erase(
+                                    r.items.begin(),
+                                    r.items.begin() + static_cast<std::ptrdiff_t>(offset));
+                        }
+                        if (limit > 0 && (int)r.items.size() > limit)
+                            r.items.resize((size_t)limit);
+                        // Rows past the provider's first page arrive with ids only; resolve this
+                        // window (details takes at most 50 ids per call) so a paged listing never
+                        // loses its names.
+                        std::vector<int64_t> unresolved;
+                        for (auto& track : r.items)
+                            if (track.name.empty() && track.id > 0)
+                                unresolved.push_back(track.id);
+                        for (size_t start = 0; start < unresolved.size(); start += 50) {
+                            std::vector<int64_t> chunk(
+                                unresolved.begin() + static_cast<std::ptrdiff_t>(start),
+                                unresolved.begin() + static_cast<std::ptrdiff_t>(
+                                                         std::min(unresolved.size(), start + 50)));
+                            std::map<int64_t, Track> known;
+                            try {
+                                for (auto& track : s.details(chunk))
+                                    known[track.id] = track;
+                            } catch (const std::exception&) {
+                                break; // keep the real ids rather than failing the page
+                            }
+                            for (auto& track : r.items) {
+                                auto found = known.find(track.id);
+                                if (found != known.end() && !found->second.name.empty())
+                                    track = found->second;
+                            }
+                        }
+                        return r;
                     }
                     if (limit > 0 && (int)r.items.size() > limit)
                         r.items.resize((size_t)limit);
@@ -1859,7 +1968,7 @@ namespace mora {
             } else if (op == "add_next" || op == "append" || op == "replace") {
                 // replace swaps the whole queue for the new set and starts its first row; append and
                 // add_next only add, so they can never throw away what is already queued.
-                size_t maxTracks = op == "replace" ? 100 : 50;
+                size_t maxTracks = op == "replace" ? 1000 : 50;
                 std::vector<Track> incoming;
                 if (params.contains("tracks")) {
                     if (!params["tracks"].is_array())
@@ -1900,7 +2009,7 @@ namespace mora {
                 } else
                     return invalid("ids or tracks are required");
                 if (incoming.empty() || incoming.size() > maxTracks)
-                    return invalid(op == "replace" ? "1..100 tracks are required"
+                    return invalid(op == "replace" ? "1..1000 tracks are required"
                                                    : "1..50 tracks are required");
                 if (op == "replace") {
                     session.assign(std::move(incoming), 0);
@@ -2026,8 +2135,24 @@ namespace mora {
                     }
                     return BridgeReply(true, "", "", sessionView());
                 }
+                if (action == "quality") {
+                    auto level = params.value("level", std::string());
+                    auto found = std::find_if(qualities.begin(), qualities.end(),
+                                              [&](const char* name) { return level == name; });
+                    if (found == qualities.end())
+                        return BridgeReply(false, "invalid_arguments",
+                                           "level must be standard, higher, exhigh, lossless or "
+                                           "hires",
+                                           Json::object());
+                    session.setQuality(*found);
+                    qualitySelected = static_cast<int>(found - qualities.begin());
+                    return BridgeReply(true, "", "",
+                                       Json{{"quality", *found},
+                                            {"appliesFrom", "next track"}});
+                }
                 return BridgeReply(false, "invalid_arguments",
-                                   "action must be pause, resume, next, previous, seek or volume",
+                                   "action must be pause, resume, next, previous, seek, volume or "
+                                   "quality",
                                    Json::object());
             }
             return BridgeReply(false, "unknown_method", "unknown session method: " + method,
@@ -2230,6 +2355,18 @@ namespace mora {
                     modal = Modal::None;
                 return;
             }
+            if (modal == Modal::Effort) {
+                if (k.wVirtualKeyCode == VK_UP)
+                    effortSelected = std::max(0, effortSelected - 1);
+                if (k.wVirtualKeyCode == VK_DOWN)
+                    effortSelected = std::min(static_cast<int>(effortLevels.size()) - 1,
+                                              effortSelected + 1);
+                if (k.wVirtualKeyCode == VK_RETURN)
+                    selectReasoningEffort(effortSelected);
+                if (k.wVirtualKeyCode == VK_ESCAPE)
+                    modal = Modal::None;
+                return;
+            }
             if (modal == Modal::Settings) {
                 // One keystroke per preference, so the panel needs no nested selection state.
                 if (k.wVirtualKeyCode == 'R')
@@ -2335,6 +2472,11 @@ namespace mora {
                 }
                 if (!home) {
                     switch (letter) {
+                    // T expands the docked conversation back to the full chat page. The conversation
+                    // itself never disappears: the side panel keeps showing it.
+                    case L'T':
+                        action(A_ChatOpen);
+                        return;
                     case L'L':
                         action(A_Login);
                         return;
@@ -2954,17 +3096,19 @@ namespace mora {
         void drawCover(Canvas& c, int x, int y, int w, int h) {
             if (cover.pixels.empty()) {
                 c.rect(x, y, w, h, colors.surface);
-                for (int row = 0; row < h; ++row) {
-                    std::wstring line;
+                for (int row = 0; row < h; ++row)
                     for (int col = 0; col < w; ++col) {
-                        double dx = (col - w / 2.0) / 2, dy = row - h / 2.0;
-                        double d = sqrt(dx * dx + dy * dy);
-                        line += d < 1.4                                           ? L'●'
-                                : d > 2 && d < h * .43 && (int)(d * 1.6) % 2 == 0 ? L'·'
-                                                                                  : L' ';
+                        auto sample = [&](int py) {
+                            int ax = col * personaAvatarWidth / std::max(1, w);
+                            int ay = py * personaAvatarHeight / std::max(1, h * 2);
+                            if (auto drawn = personaAvatarPixel(persona.id, ax, ay))
+                                return drawn;
+                            return personaGeneratedPixel(persona, ax, ay);
+                        };
+                        auto top = sample(row * 2), bottom = sample(row * 2 + 1);
+                        c.pixel(x + col, y + row, L'▀', top.value_or(colors.surface),
+                                bottom.value_or(colors.surface));
                     }
-                    c.text(x, y + row, line, colors.muted, w);
-                }
                 return;
             }
             for (int j = 0; j < h; ++j)
@@ -3105,47 +3249,187 @@ namespace mora {
                 }
             }
         }
-        void drawChat(Canvas& c) {
-            c.text(4, 5, persona.name + L" · " + persona.tagline, colors.accent, width - 8);
-            struct ChatLine { std::wstring text; bool fromUser; };
+        // One laid-out conversation row. `name` rows carry the sender label, and the first body row
+        // of a message (`avatar`) is the one the portrait or the user badge is drawn beside.
+        struct ChatLine {
+            std::wstring text;
+            bool fromUser = false;
+            bool name = false;
+            bool avatar = false;
+            int indent = 0;
+        };
+        // A conversation is wrapped for a given column budget, so the full conversation page and the
+        // narrow route-page dock share one layout instead of two divergent copies. The dock drops the
+        // sender labels because its rows are scarce and the panel header already names the persona:
+        // the avatar and the two-sided alignment are what identify each speaker there.
+        std::vector<ChatLine> chatLines(int panelWidth, int avatarCols, bool withNames) const {
             std::vector<ChatLine> lines;
-            auto append = [&](const std::wstring& value, bool fromUser, int lineWidth) {
-                std::wstring remaining = value;
-                while (!remaining.empty()) {
+            int userIndent = 1, userLimit = std::max(6, panelWidth - avatarCols - 3);
+            int aiIndent = avatarCols + 2, aiLimit = std::max(6, panelWidth - aiIndent - 1);
+            auto wrap = [&](const std::wstring& value, bool fromUser, const std::wstring& who,
+                            int indent, int limit) {
+                if (withNames) {
+                    ChatLine label;
+                    label.text = who;
+                    label.fromUser = fromUser;
+                    label.name = true;
+                    label.indent = indent;
+                    lines.push_back(std::move(label));
+                }
+                std::wstring rest = value;
+                bool first = true;
+                do {
                     size_t n = 0;
                     int used = 0;
-                    while (n < remaining.size() && remaining[n] != L'\n') {
-                        int cw = displayWidth(std::wstring_view(&remaining[n], 1));
-                        if (used + cw > lineWidth)
+                    while (n < rest.size() && rest[n] != L'\n') {
+                        int cw = displayWidth(std::wstring_view(&rest[n], 1));
+                        if (used + cw > limit)
                             break;
                         used += cw;
                         ++n;
                     }
-                    if (!n && remaining[0] != L'\n')
+                    if (!n && !rest.empty() && rest[0] != L'\n')
                         n = 1;
-                    lines.push_back({remaining.substr(0, n), fromUser});
-                    remaining.erase(0, n);
-                    if (!remaining.empty() && remaining[0] == L'\n')
-                        remaining.erase(0, 1);
-                }
+                    ChatLine line;
+                    line.text = rest.substr(0, n);
+                    line.fromUser = fromUser;
+                    line.avatar = first;
+                    line.indent = indent;
+                    lines.push_back(std::move(line));
+                    first = false;
+                    rest.erase(0, n);
+                    if (!rest.empty() && rest[0] == L'\n')
+                        rest.erase(0, 1);
+                } while (!rest.empty());
             };
+            std::wstring me = userName.empty() ? L"你" : userName;
             for (const auto& [prompt, answer] : chatLog) {
-                append((userName.empty() ? L"用户" : userName) + L"  " + prompt, true,
-                       width - 8);
-                lines.push_back({L"", false});
-                append(answer.empty() ? L"模型没有返回文字" : answer, false, width - 12);
-                lines.push_back({L"", false});
-                lines.push_back({L"", false});
+                wrap(prompt.empty() ? L"（空消息）" : prompt, true, me, userIndent, userLimit);
+                wrap(answer.empty() ? L"模型没有返回文字" : answer, false, persona.name, aiIndent,
+                     aiLimit);
+                lines.push_back(ChatLine{});
             }
-            int visible = std::max(1, height - 18);
+            return lines;
+        }
+        // The persona portrait, sampled from the same 48x50 sprite the homepage uses. A persona
+        // without drawn art keeps its deterministic procedural face, exactly like the homepage.
+        void drawChatAvatar(Canvas& c, int x, int y, int cols, int rows, int limitY) {
+            for (int row = 0; row < rows && y + row < limitY; ++row)
+                for (int col = 0; col < cols; ++col) {
+                    auto sample = [&](int py) {
+                        int ax = col * personaAvatarWidth / std::max(1, cols);
+                        int ay = py * personaAvatarHeight / std::max(1, rows * 2);
+                        if (auto drawn = personaAvatarPixel(persona.id, ax, ay))
+                            return drawn;
+                        return personaGeneratedPixel(persona, ax, ay);
+                    };
+                    auto top = sample(row * 2), bottom = sample(row * 2 + 1);
+                    c.pixel(x + col, y + row, L'▀', top.value_or(colors.surface),
+                            bottom.value_or(colors.surface));
+                }
+        }
+        // The user's own side of the conversation is a solid accent tile, the terminal equivalent of
+        // a QQ avatar, so the two speakers never blur into one block of text.
+        void drawChatBadge(Canvas& c, int x, int y, int cols, int rows, int limitY) {
+            if (cols < 2)
+                return;
+            int height = std::min(rows, std::max(0, limitY - y));
+            if (height <= 0)
+                return;
+            c.rect(x, y, cols, height, colors.accent);
+            if (height >= 2) {
+                auto initial = userName.empty() ? std::wstring(L"你") : userName.substr(0, 1);
+                c.text(x + std::max(0, (cols - 2) / 2), y + height / 2 - 1, initial,
+                       colors.background, cols);
+            }
+        }
+        void drawChatLines(Canvas& c, const std::vector<ChatLine>& lines, int x, int y, int w,
+                           int rows, int avatarCols, int avatarRows) {
+            int visible = std::max(1, rows);
             chatScroll = std::clamp(chatScroll, 0, std::max(0, (int)lines.size() - visible));
             int begin = std::max(0, (int)lines.size() - visible - chatScroll);
             int end = std::min((int)lines.size(), begin + visible);
-            int y = height - 10 - (end - begin);
-            for (int i = begin; i < end; ++i, ++y)
-                c.text(lines[i].fromUser ? 4 : 6, y, lines[i].text,
-                       lines[i].fromUser ? colors.text : colors.muted,
-                       lines[i].fromUser ? width - 8 : width - 12);
+            int limitY = y + visible;
+            int cursor = y + visible - (end - begin);
+            for (int i = begin; i < end; ++i, ++cursor) {
+                const auto& line = lines[(size_t)i];
+                if (line.name) {
+                    c.text(x + line.indent, cursor, line.text, colors.muted,
+                           std::max(0, w - line.indent));
+                    continue;
+                }
+                int text = x + line.indent;
+                int room = std::max(0, w - line.indent);
+                if (line.avatar && line.fromUser) {
+                    int badgeX = x + w - avatarCols;
+                    if (badgeX > text + 2)
+                        drawChatBadge(c, badgeX, cursor, avatarCols, avatarRows, limitY);
+                } else if (line.avatar)
+                    drawChatAvatar(c, x, cursor, avatarCols, avatarRows, limitY);
+                c.text(text, cursor, line.text, line.fromUser ? colors.text : colors.muted, room);
+            }
+        }
+        void drawChat(Canvas& c) {
+            constexpr int avatarCols = 6, avatarRows = 3;
+            c.text(4, 5, persona.name + L" · " + persona.tagline, colors.accent, width - 8);
+            if (chatLog.empty()) {
+                c.text(4, 8, L"输入你想聊的音乐话题，或直接说想听什么。", colors.muted, width - 8);
+                c.text(4, 10, L"需要事实、候选或播放状态时，Agent 会调用音乐工具；"
+                              L"聊听感与看法时不会动播放。",
+                       colors.muted, width - 8);
+                return;
+            }
+            auto lines = chatLines(width - 8, avatarCols, true);
+            drawChatLines(c, lines, 4, 7, width - 8, std::max(1, height - 14), avatarCols,
+                          avatarRows);
+        }
+        // The route-page dock: the conversation stays on screen next to the result list instead of
+        // vanishing when a browse page is opened, and one click expands it to the full page.
+        void drawChatDock(Canvas& c, int x, int y, int w, int bottom) {
+            chatDockVisible = false;
+            if (bottom - y < 1 || w < 10)
+                return;
+            constexpr int avatarCols = 6, avatarRows = 3;
+            auto clickable = [&] {
+                for (int row = y; row < bottom; ++row)
+                    c.mark(x, row, w, A_ChatOpen);
+                chatDockLeft = x;
+                chatDockRight = x + w;
+                chatDockTop = y;
+                chatDockBottom = bottom;
+                chatDockVisible = true;
+            };
+            if (bottom - y < 4) {
+                // A short terminal leaves no room for the conversation itself. The chat still stays
+                // on screen, named and one click (or T) away, instead of vanishing.
+                std::wstring header = L"❯ " + persona.name + L" · 对话 · T";
+                if (chatWaiting)
+                    header += L" ◌";
+                c.text(x, y, header, colors.accent, w);
+                if (bottom - y >= 2 && !chatLog.empty())
+                    c.text(x, y + 1, truncate(chatLog.back().second, w), colors.muted, w);
+                clickable();
+                return;
+            }
+            std::wstring header = L"❯ " + persona.name + L" · 对话";
+            if (chatWaiting)
+                header += L" ◌";
+            c.text(x, y, header, colors.accent, w);
+            // The hint is placed by rendered width, not by code-unit count: ❯ is a double-width
+            // glyph, so counting its UTF-16 length would overwrite the header's last characters.
+            int headerWidth = displayWidth(std::wstring_view(header));
+            std::wstring hint = L"点击展开 · T";
+            if (w - headerWidth - 2 >= displayWidth(std::wstring_view(hint)))
+                c.text(x + headerWidth + 1, y, hint, colors.muted, w - headerWidth - 1);
+            c.line(x, y + 1, w, colors.surface);
+            if (chatLog.empty()) {
+                c.text(x, y + 2, L"点击展开后对我说想听什么。", colors.muted, w);
+                clickable();
+                return;
+            }
+            auto lines = chatLines(w, avatarCols, false);
+            drawChatLines(c, lines, x, y + 2, w, bottom - (y + 2), avatarCols, avatarRows);
+            clickable();
         }
         void drawComposer(Canvas& c) {
             int y = height - 6;
@@ -3173,7 +3457,7 @@ namespace mora {
                 detail ? L"↑↓ 滚动歌词  ·  Enter 回到当前行  ·  Space 暂停  ·  Esc 返回"
                 : searchFocus
                     ? L"Enter 发送  ·  / 命令  ·  Tab 补全  ·  ↑↓ 历史  ·  Esc 返回"
-                    : L"↑↓ 选择  ·  Enter 播放  ·  / 命令  ·  Tab 输入  ·  /home 首页";
+                    : L"↑↓ 选择  ·  Enter 播放  ·  T 对话  ·  Tab 输入  ·  /home 首页";
             c.text(4, height - 2, hint, colors.muted, width - 20);
             c.text(width - 14, height - 2,
                    std::to_wstring((int)(session.volume() * 100)) + L"% VOL", colors.accent,
@@ -3450,6 +3734,26 @@ namespace mora {
                     c.button(x + 3, y + 5 + i * 2, w - 6, truncate(label, w - 10),
                              A_DeviceRow + index, index == deviceSelected);
                 }
+            } else if (modal == Modal::Effort) {
+                txt(2, L"思考强度 · reasoning_effort");
+                int rows = std::min(static_cast<int>(effortLevels.size()), std::max(1, h - 5));
+                int from = std::clamp(effortSelected - rows + 1, 0,
+                                      std::max(0, static_cast<int>(effortLevels.size()) - rows));
+                for (int i = 0; i < rows; ++i) {
+                    int index = from + i;
+                    if (index >= static_cast<int>(effortLevels.size()))
+                        break;
+                    std::string level = effortLevels[(size_t)index];
+                    bool active = level == effortCurrent;
+                    std::wstring label = (active ? L"● " : L"○ ") + effortLabel(level);
+                    if (level.empty())
+                        label += L"（不发送 reasoning 字段）";
+                    else if (level == "off")
+                        label += L"（等同于不发送）";
+                    c.button(x + 3, y + 4 + i, w - 6, truncate(label, w - 10),
+                             A_EffortRow + index, index == effortSelected);
+                }
+                c.text(x + 3, y + h - 1, L"↑↓ 选择 · Enter 应用 · Esc 取消", colors.muted, w - 6);
             } else if (modal == Modal::Phone || modal == Modal::Code) {
                 txt(2, modal == Modal::Phone ? L"手机号登录 · 国家区号 86" : L"输入短信验证码");
                 txt(5, modal == Modal::Phone ? L"手机号" : L"验证码");
@@ -3542,6 +3846,8 @@ namespace mora {
                 c.button(x + 3, y + 11, half, L"D  清除本机密钥", A_AiClearKey);
                 c.button(x + 5 + half, y + 11, half, L"F  从端点发现模型", A_AiDiscover);
                 c.button(x + 3, y + 12, w - 6, L"L  查看已缓存的模型目录", A_AiCached);
+                if (h > 13)
+                    c.button(x + 3, y + 13, w - 6, L"E  思考强度（reasoning_effort）", A_EffortOpen);
                 if (h > 16)
                     txt(14, L"/chat 对话；模态只按端点报告展示，用户不能手选。");
             } else if (modal == Modal::AiModels) {
@@ -3668,6 +3974,9 @@ namespace mora {
             width = dims.first;
             height = dims.second;
             auto c = std::make_unique<Canvas>(width, height, colors);
+            // The dock is rebuilt from scratch every frame; a page without one must never keep a
+            // stale hit region or wheel target from the previous frame.
+            chatDockVisible = false;
             if (width < 78 || height < 24) {
                 c->text(3, 3, L"MORA 云间", colors.accent);
                 c->text(3, 6, L"请将终端放大至至少 78 × 24", colors.text);
@@ -3729,7 +4038,7 @@ namespace mora {
                 summary += L" · " + modeLabel(session.mode());
                 c->text(3, 7, truncate(summary, width - 20), colors.accent, width - 20);
             } else
-                c->text(3, 7, L"Enter 播放 · D 歌曲详情与歌词 · [ ] 翻页", colors.muted, width - 20);
+                c->text(3, 7, L"Enter 播放 · D 详情 · T 对话 · [ ] 翻页", colors.muted, width - 20);
             c->button(width - 13, 7, 10, L"D 详情", A_Detail);
             for (int i = 0; i < listH && top + i < (int)rows.size(); ++i) {
                 int index = top + i;
@@ -3766,21 +4075,25 @@ namespace mora {
             }
             int controlY = height - 12;
             if (sidePanel) {
-                int x = listW + 7, w = width - x - 4, artH = std::clamp(height - 28, 4, 12),
-                    artW = std::min(artH * 2, w);
+                int x = listW + 7, w = width - x - 4;
+                // The conversation is a permanent part of a browse/route page, so its rows are
+                // reserved before the cover art: the chat yields to nothing and never silently
+                // disappears when the user switches pages.
+                int panelBottom = controlY - 3;
+                int panelRows = std::max(8, panelBottom + 1 - 8);
+                int dockRows = std::clamp(panelRows - 12, 4, 14);
+                int artH = std::clamp(panelRows - dockRows - 7, 3, 12), artW = std::min(artH * 2, w);
                 drawCover(*c, x + (w - artW) / 2, 8, artW, artH);
                 int y = 9 + artH;
                 const Track& track = session.playing();
                 c->text(x, y, track.id ? track.name : L"尚未播放", colors.text, w);
-                c->text(x, y + 2, track.id && !track.artist.empty() ? track.artist : L"—",
-                        colors.muted, w);
-                c->text(x, y + 3, track.id && !track.album.empty() ? track.album : L"—",
+                c->text(x, y + 1, track.id && !track.artist.empty() ? track.artist : L"—",
                         colors.muted, w);
                 std::wstring format =
                     state.sampleRate ? L" · " + std::to_wstring(state.sampleRate / 1000) + L"k/" +
                                            std::to_wstring(state.sampleBits) + L"bit"
                                      : L"";
-                c->text(x, y + 4,
+                c->text(x, y + 2,
                         actualQualityLabel() + format + L" · " + modeLabel(session.mode()),
                         colors.accent, w);
                 std::wstring lyric;
@@ -3793,8 +4106,12 @@ namespace mora {
                             lyric = L"♪ " + currentLyrics.lines[(size_t)index].text;
                     }
                 }
-                if (!lyric.empty() && y + 6 < controlY - 2)
-                    c->text(x, y + 6, truncate(lyric, w), colors.accent, w);
+                int dockTop = y + 3;
+                if (!lyric.empty() && dockTop < panelBottom) {
+                    c->text(x, dockTop, truncate(lyric, w), colors.accent, w);
+                    ++dockTop;
+                }
+                drawChatDock(*c, x, dockTop, w, panelBottom + 1);
             }
             c->line(3, controlY - 2, width - 6, colors.surface);
             c->text(3, controlY - 1,
@@ -3880,12 +4197,13 @@ namespace mora {
                       a == A_CompressToggle)) ||
                     (modal == Modal::Ai &&
                      (a == A_AiKey || a == A_AiModel || a == A_AiClearKey || a == A_AiDiscover ||
-                      a == A_AiCached)) ||
+                      a == A_AiCached || a == A_EffortOpen)) ||
                     (modal == Modal::AiModels && a >= A_ModelRow && a < A_ModelRow + 64) ||
                     (modal == Modal::Stats &&
                      (a == A_StatsDay || a == A_StatsMonth || a == A_StatsYear)) ||
                     (modal == Modal::Persona && a >= A_PersonaRow && a < A_DeviceRow) ||
-                    (modal == Modal::Device && a >= A_DeviceRow) ||
+                    (modal == Modal::Device && a >= A_DeviceRow && a < A_EffortRow) ||
+                    (modal == Modal::Effort && a >= A_EffortRow && a < A_EffortRow + 16) ||
                     (modal == Modal::Quality && a >= A_QualityRow);
                 if (allowed)
                     action(a);
@@ -3926,6 +4244,11 @@ namespace mora {
                     saveSelected = std::clamp(saveSelected + step, 0,
                                               std::max(0, (int)saveRows.size() - 1));
                 else if (modal == Modal::None && chatView)
+                    chatScroll = std::max(0, chatScroll - step);
+                // A wheel over the docked conversation scrolls the conversation; anywhere else on the
+                // page still moves the result list.
+                else if (modal == Modal::None && chatDockVisible && x >= chatDockLeft &&
+                         x < chatDockRight && y >= chatDockTop && y < chatDockBottom)
                     chatScroll = std::max(0, chatScroll - step);
                 else if (modal == Modal::None)
                     navigate(step);

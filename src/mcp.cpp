@@ -57,15 +57,25 @@ namespace mora {
                     {"serverInfo", Json{{"name", "mora-music"}, {"version", "0.7.0-preview"}}},
                     {"instructions",
                      "MORA music sub-agent. music_search and music_open_collection return real "
-                     "NetEase metadata, never stream URLs or account cookies. music_play, "
-                     "music_control and music_now_playing control the one MORA terminal player "
-                     "through a local per-user session pipe and report needs_player when no "
-                     "terminal player is attached. music_recommend returns real candidates without "
-                     "starting playback; music_play_random starts one selected track. "
-                     "music_list_playlists, music_set_like and music_add_to_playlist use the "
-                     "signed-in player's account; writes require an explicit target and are never "
-                     "retried automatically. music_now_playing also reports the lyric line being "
-                     "sung, and music_get_lyrics returns the bounded timed lyrics."}};
+                     "NetEase metadata, never stream URLs or account cookies; open_collection only "
+                     "pages a collection and never starts playback. music_play, music_control "
+                     "(pause/resume/next/previous/seek/volume/quality) and music_now_playing control "
+                     "the one MORA terminal player through a local per-user session pipe and report "
+                     "needs_player when no terminal player is attached. music_recommend returns real "
+                     "candidates without starting playback; music_play_random starts one selected "
+                     "track; music_recommend_queue replaces the queue with N songs in one call "
+                     "(source=search with an intent, source=playlists for the account's playlists, "
+                     "source=liked for the liked list, source=auto which falls back to the playlists "
+                     "only when the search returns nothing) and music_list_likes pages the liked "
+                     "songs; music_get_like reads one song's liked state and music_set_like changes "
+                     "it. music_queue_list/music_queue_edit inspect and change the one queue "
+                     "(one write per call, op=replace takes up to 1000 ids). music_list_playlists, "
+                     "music_set_like and music_add_to_playlist use the signed-in player's account; "
+                     "writes require an explicit target and are never retried automatically. "
+                     "music_get_status reports whether a player is attached and whether the account "
+                     "is signed in (nickname only, never a credential). music_now_playing also "
+                     "reports the lyric line being sung, and music_get_lyrics returns the bounded "
+                     "timed lyrics."}};
                 phase = Phase::AwaitInitialized;
             } else if (method == "ping")
                 response["result"] = Json::object();
@@ -112,11 +122,16 @@ namespace mora {
                                                     utf8(sanitize(unutf8(e.what())))}}},
                         {"isError", true}};
                 } catch (const std::exception& e) {
-                    response["result"] =
-                        Json{{"content",
-                              Json::array({Json{{"type", "text"},
-                                                {"text", utf8(sanitize(unutf8(e.what())))}}})},
-                             {"isError", true}};
+                    // Anything that is not a ToolError still answers with a structured code, so a
+                    // host never has to parse prose to tell "local session is unreadable" from a
+                    // protocol failure.
+                    auto text = utf8(sanitize(unutf8(e.what())));
+                    response["result"] = Json{
+                        {"content",
+                         Json::array({Json{{"type", "text"}, {"text", "session_error: " + text}}})},
+                        {"structuredContent",
+                         Json{{"ok", false}, {"error", "session_error"}, {"message", text}}},
+                        {"isError", true}};
                 }
             } else
                 return error(-32601, "Method not found");

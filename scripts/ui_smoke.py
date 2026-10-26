@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
@@ -94,6 +95,15 @@ def console_rows(width=116,height=36):
         assert k.ReadConsoleOutputCharacterW(conout,buffer,width,Coord(0,row),c.byref(read))
         rows.append(buffer[:read.value])
     return rows
+
+def dock_column(row,index):
+    """Map a console_rows() string index back to the real console column.
+
+    ReadConsoleOutputCharacterW returns one character for a double-width cell pair, so every
+    East-Asian wide glyph before `index` shifts the returned string one column to the left.
+    Clicking needs the real column, not the string index.
+    """
+    return index+sum(1 for ch in row[:index] if unicodedata.east_asian_width(ch) in ('W','F'))
 
 def window_size():
     """Actual console window size and origin; a silently failed resize would invalidate a test."""
@@ -213,6 +223,69 @@ try:
             assert any('▸' in line and '七里香' in line for line in rows), \
                 f'queue page does not mark the current row\n'+'\n'.join(rows)
             checks.append('queue page marks the current row')
+
+            # --- The conversation stays docked on every route page ---------------------
+            expect('小阿木 · 对话','queue page keeps the chat dock header')
+            expect('点击展开 · T','the dock advertises how to open the conversation')
+            rows=console_rows()
+            assert any('· 对话' in line for line in rows), \
+                f'the queue page has no docked conversation header\n'+'\n'.join(rows)
+            assert any('点击展开后对我说想听什么' in line for line in rows), \
+                f'the empty dock does not say how to open it\n'+'\n'.join(rows)
+            checks.append('the queue page docks the conversation with its header and hint')
+            # Browsing to another route page must not take the conversation away.
+            send(ord('1'),'1')
+            expect('Enter 播放 · D 详情 · T 对话 · [ ] 翻页','switched to the songs route page')
+            expect('小阿木 · 对话','the chat dock follows the page switch')
+            checks.append('the chat dock persists across route page switches')
+            send(53)
+            expect('队列 8 首','back on the queue page')
+
+            # --- T expands the dock to the full conversation page ------------------------
+            send(0,'T')
+            expect('输入你想聊的音乐话题，或直接说想听什么。',
+                   'T expands the docked conversation to the full page')
+            deadline=time.monotonic()+3
+            while time.monotonic()<deadline and any('点击展开' in line for line in console_rows()):
+                time.sleep(.1)
+            rows=console_rows()
+            assert not any('点击展开' in line for line in rows), \
+                f'the full chat page still shows the dock hint\n'+'\n'.join(rows)
+            checks.append('the full chat page drops the dock hint')
+
+            # --- Esc collapses it back, and the dock is still there ----------------------
+            send(27);time.sleep(.2)
+            expect('队列 8 首','Esc collapses the conversation back to the queue page')
+            expect('小阿木 · 对话','the dock header is back after Esc')
+            checks.append('Esc collapses the full conversation back to the docked page')
+
+            # --- A mouse click on the dock opens it too ----------------------------------
+            rows=console_rows()
+            dock=[i for i,line in enumerate(rows) if '· 对话' in line]
+            assert dock, f'the dock header is missing before the click test\n'+'\n'.join(rows)
+            arrow=rows[dock[0]].find('❯')
+            assert arrow>=0, \
+                f'the dock header does not start with the conversation marker\n{rows[dock[0]]!r}'
+            column=dock_column(rows[dock[0]],arrow)
+            panel_x=116*59//100+7
+            assert column==panel_x, \
+                f'the dock marker sits at column {column}, expected the side panel at {panel_x}'
+            click(column+2,dock[0]);time.sleep(.3)
+            expect('输入你想聊的音乐话题，或直接说想听什么。',
+                   'a click on the dock header opens the full conversation')
+            checks.append('a mouse click on the dock opens the full conversation')
+            send(27);time.sleep(.2)
+            expect('队列 8 首','Esc closes the conversation opened by the click')
+
+            # --- The whole dock area is a click target, not just the header --------------
+            # Fixed coordinate from the verified 116x36 frame: the side panel spans x=75..111
+            # and the conversation dock covers rows 15..21, so (90,18) lands inside its body.
+            click(90,18);time.sleep(.3)
+            expect('输入你想聊的音乐话题，或直接说想听什么。',
+                   'a click inside the dock body opens the full conversation')
+            checks.append('a mouse click inside the dock body opens the full conversation')
+            send(27);time.sleep(.2)
+            expect('队列 8 首','Esc closes the dock-body click too')
 
             # --- Detail page: cover, metadata, truthful lyrics state, Esc returns --------
             send(0,'D')
@@ -386,13 +459,212 @@ $protected=[Security.Cryptography.ProtectedData]::Protect($bytes,$null,[Security
                 command('/ai')
                 expect_console('从端点发现模型','/ai exposes endpoint model discovery')
                 expect_console('查看已缓存的模型目录','/ai exposes the cached model catalogue')
+                expect_console('思考强度：provider 默认','/ai panel exposes the reasoning strength row')
                 send(27);time.sleep(.2)
+                # --- Reasoning strength is a real picker, not a line of advice ---------------
+                # `/effort` used to only print the ladder while rejecting the very word it printed.
+                # The picker, its arrows, Enter, the mouse and the default alias are all exercised
+                # against this isolated profile's agent.json, never the user's real one.
+                effort_file=Path(isolated)/'agent.json'
+                def stored_effort():
+                    try:
+                        return json.loads(effort_file.read_text(encoding='utf-8')).get('reasoningEffort')
+                    except (OSError,ValueError):
+                        return None
+                def wait_effort(value,label):
+                    deadline=time.monotonic()+4
+                    while time.monotonic()<deadline and stored_effort()!=value:
+                        time.sleep(.1)
+                    assert stored_effort()==value, \
+                        f'{label}: agent.json has reasoningEffort={stored_effort()!r}, expected {value!r}\n'+ \
+                        (effort_file.read_text(encoding='utf-8') if effort_file.exists()
+                         else '<no agent.json>')
+                    checks.append(label)
+                def effort_rows(timeout=3):
+                    """Locate every level row from the real console.
+
+                    The page behind the modal shares each row with the picker label, so the marker
+                    is searched inside the row instead of at its stripped start.
+                    """
+                    deadline=time.monotonic()+timeout
+                    listed,rows={},[]
+                    while True:
+                        listed,rows={},console_rows()
+                        for index,row in enumerate(rows):
+                            for marker in ('○ ','● '):
+                                for level in ('provider 默认','off','minimal','low','medium','high',
+                                              'xhigh','max'):
+                                    if marker+level in row:
+                                        listed[level]=index
+                        if len(listed)==8 or time.monotonic()>deadline:
+                            return listed,rows
+                command('/effort')
+                expect_console('思考强度 · reasoning_effort','/effort with no argument opens the picker')
+                listed,rows=effort_rows()
+                assert set(listed)=={'provider 默认','off','minimal','low','medium','high','xhigh','max'}, \
+                    f'the picker does not list the whole ladder: {sorted(listed)}\n'+'\n'.join(rows)
+                checks.append('the picker lists provider default, off and the DST ladder')
+                expect_console('不发送 reasoning 字段','the default row explains that no field is sent')
+                active=[index for index,row in enumerate(rows)
+                        if '● ' in row and index in set(listed.values())]
+                assert active==[listed['provider 默认']], \
+                    f'the picker does not start on the stored level: {active}, default row {listed["provider 默认"]}'
+                checks.append('the picker starts on the stored provider default')
+                send(40);send(40);send(13)
+                expect_console('思考强度 · minimal','↓↓ + Enter applies the minimal level')
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline and \
+                        any('思考强度 · reasoning_effort' in row for row in console_rows()):
+                    time.sleep(.1)
+                rows=console_rows()
+                assert not any('思考强度 · reasoning_effort' in row for row in rows), \
+                    'the picker stayed open after Enter\n'+'\n'.join(rows)
+                checks.append('Enter applies the level and closes the picker')
+                wait_effort('minimal','the picker choice is persisted as reasoningEffort="minimal"')
+                raw=effort_file.read_text(encoding='utf-8')
+                assert '"reasoningEffort": "minimal"' in raw, \
+                    f'agent.json does not literally carry the chosen level\n{raw}'
+                checks.append('agent.json literally stores "reasoningEffort": "minimal"')
+
+                command('/effort default')
+                expect_console('思考强度 · provider 默认','/effort default applies the provider default')
+                wait_effort('','default is stored as an empty reasoningEffort, not the literal word')
+                raw=effort_file.read_text(encoding='utf-8')
+                assert '"reasoningEffort": ""' in raw, \
+                    f'default is not stored as an empty string\n{raw}'
+                assert '"reasoningEffort": "default"' not in raw, \
+                    f'default was written literally into agent.json\n{raw}'
+                checks.append('agent.json literally stores "reasoningEffort": ""')
+                checks.append('agent.json never stores the literal "default"')
+
+                command('/effort nonsense')
+                expect_console('可用档位：','/effort still rejects an unknown level')
+                assert stored_effort()=='', \
+                    f'a rejected level changed the stored effort: {stored_effort()!r}'
+                checks.append('a rejected level leaves the stored effort untouched')
+
+                command('/effort')
+                expect_console('思考强度 · reasoning_effort','the picker reopens for the mouse test')
+                listed,rows=effort_rows()
+                target=listed['high']
+                # Click the rendered label itself; its string index is mapped back to the real
+                # console column the same way the dock-click check does it.
+                label_at=rows[target].find('○ high')
+                if label_at<0:
+                    label_at=rows[target].find('● high')
+                assert label_at>=0, f'the high row lost its label: {rows[target]!r}'
+                column=dock_column(rows[target],label_at+2)
+                time.sleep(.2)
+                click(column,target)
+                expect_console('思考强度 · high','a mouse click on a row applies that level')
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline and \
+                        any('思考强度 · reasoning_effort' in row for row in console_rows()):
+                    time.sleep(.1)
+                rows=console_rows()
+                assert not any('思考强度 · reasoning_effort' in row for row in rows), \
+                    'the picker stayed open after the mouse click\n'+'\n'.join(rows)
+                checks.append('the mouse-applied row closes the picker')
+                wait_effort('high','the mouse-chosen level is persisted')
+
+                command('/effort')
+                expect_console('思考强度 · reasoning_effort','the picker reopens for the Esc test')
+                send(40);send(27)
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline and \
+                        any('思考强度 · reasoning_effort' in row for row in console_rows()):
+                    time.sleep(.1)
+                rows=console_rows()
+                assert not any('思考强度 · reasoning_effort' in row for row in rows), \
+                    'Esc did not close the picker\n'+'\n'.join(rows)
+                assert stored_effort()=='high', \
+                    f'Esc changed the stored effort: {stored_effort()!r}'
+                checks.append('Esc closes the picker without changing the stored level')
+
+                command('/effort default')
+                wait_effort('','the isolated profile is left on the provider default')
+                # --- The /ai entry point and the remaining default aliases -------------------
+                # A_EffortOpen reaches openEffortPicker() through the modal allow-list
+                # (modal == Ai && a == A_EffortOpen), a branch `/effort` never touches: the button
+                # itself has to be clicked, and its row/column come back from the console.
+                command('/effort medium')
+                wait_effort('medium','/effort medium sets a non-default level for the alias tests')
+                command('/effort provider')
+                expect_console('思考强度 · provider 默认','/effort provider applies the provider default')
+                wait_effort('','provider is stored as an empty reasoningEffort, like default')
+                command('/effort low')
+                wait_effort('low','/effort low sets the level the /ai picker must open on')
+                # Park a different status line so the later `思考强度 · low` can only come from the
+                # picker's Enter, not from the command that set the level.
+                command('/effort nonsense')
+                expect_console('可用档位：','the status line is reset before the /ai Enter test')
+                assert stored_effort()=='low', \
+                    f'the rejected level changed the stored effort: {stored_effort()!r}'
+
+                command('/ai')
+                expect_console('思考强度（reasoning_effort）','/ai shows the effort button row')
+                ai_rows=console_rows()
+                e_rows=[index for index,row in enumerate(ai_rows)
+                        if '思考强度（reasoning_effort）' in row]
+                assert len(e_rows)==1, \
+                    f'expected exactly one effort button row, found {e_rows}\n'+'\n'.join(ai_rows)
+                e_row=e_rows[0]
+                e_col=dock_column(ai_rows[e_row],ai_rows[e_row].find('思考强度（reasoning_effort）'))
+                time.sleep(.2)
+                click(e_col,e_row)
+                expect_console('思考强度 · reasoning_effort','the /ai effort button opens the picker')
+                listed,rows=effort_rows()
+                assert set(listed)=={'provider 默认','off','minimal','low','medium','high','xhigh','max'}, \
+                    f'the picker opened from /ai does not list the ladder: {sorted(listed)}\n'+'\n'.join(rows)
+                checks.append('the picker opened from the /ai button lists the DST ladder')
+                active=[index for index,row in enumerate(rows)
+                        if '● ' in row and index in set(listed.values())]
+                assert active==[listed['low']], \
+                    f'the /ai picker does not open on the stored level: {active}, low row {listed["low"]}'
+                checks.append('the /ai picker opens on the stored level')
+                before=stored_effort()
+                assert before=='low', f'the /ai button test starts from {before!r}, expected "low"'
+                send(13)
+                expect_console('思考强度 · low','Enter on the /ai-opened picker applies the stored level')
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline and \
+                        any('思考强度 · reasoning_effort' in row for row in console_rows()):
+                    time.sleep(.1)
+                rows=console_rows()
+                assert not any('思考强度 · reasoning_effort' in row for row in rows), \
+                    'the picker opened from /ai stayed open after Enter\n'+'\n'.join(rows)
+                checks.append('Enter closes the picker the /ai button opened')
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline and stored_effort()!=before:
+                    time.sleep(.1)
+                assert stored_effort()==before=='low', \
+                    f'the /ai-opened picker changed the stored level: {stored_effort()!r} != {before!r}'
+                checks.append('the /ai button leaves agent.json on the same level when Enter re-applies it')
+
+                command('/effort auto')
+                expect_console('思考强度 · provider 默认','/effort auto applies the provider default')
+                wait_effort('','auto is stored as an empty reasoningEffort, like default')
                 # --- A chat turn with no key must never fabricate a compression note --------
                 command('你好')
                 expect_console('模型请求失败','chat without a model key fails honestly')
                 assert '已压缩' not in ''.join(console_rows()), \
                     'a compression note was shown although nothing was compressed'
                 checks.append('no compression note while nothing was compressed')
+                # --- A real conversation stays docked on route pages, avatar included ------
+                chat_rows=console_rows()
+                assert any('▀▀▀▀▀▀' in line and '模型请求失败' in line for line in chat_rows), \
+                    'the assistant avatar is not rendered beside its reply\n'+'\n'.join(chat_rows)
+                user_rows=[line for line in chat_rows if '你好' in line]
+                assert any(line.rfind('s')>line.find('你好') for line in user_rows), \
+                    'the user message has no solid accent badge on its own side\n'+'\n'.join(chat_rows)
+                checks.append('the chat page renders the assistant avatar and the user badge')
+                command('/queue')
+                expect_console('· 对话','a route page keeps the chat dock after a real turn')
+                expect_console('模型请求失败','the dock shows the real conversation body')
+                rows=console_rows()
+                assert any('▀▀▀▀▀▀' in line and '模型请求失败' in line for line in rows), \
+                    'the docked conversation does not render the assistant avatar\n'+'\n'.join(rows)
+                checks.append('the docked conversation keeps the reply and avatar after a page switch')
                 command('/home')
                 expect_console('还没有正在播放的歌曲','home after the failed chat turn')
                 command('/quit')
